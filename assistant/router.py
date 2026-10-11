@@ -11,9 +11,18 @@ Questions and chit-chat that match no pattern go straight to the LLM.
 
 import re
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Callable
 
-from .tools import NotFound, ToolError, Workspace, resolve_app, resolve_site
+from .tools import (
+    Elsewhere,
+    NotFound,
+    ToolError,
+    Workspace,
+    _normalize,
+    resolve_app,
+    resolve_site,
+)
 
 
 @dataclass(frozen=True)
@@ -65,8 +74,14 @@ def _open_here(m: re.Match) -> Intent | None:
     return Intent("open_here", app) if app in ("terminal", "vscode") else None
 
 
-def _read(m: re.Match) -> Intent:
+# "Explain it again", "what does that do": about the last file, not a file named "it".
+_PRONOUN_TARGET = re.compile(r"(?:it|that|this|them|those|these)\b.*")
+
+
+def _read(m: re.Match) -> Intent | None:
     name = _target(m["name"])
+    if _PRONOUN_TARGET.fullmatch(name):
+        return None
     file_name = _FILE_NAME.match(name)
     if file_name:
         name = file_name.group(0)  # drop trailing words: "main.py in simple terms"
@@ -220,6 +235,12 @@ def execute(intent: Intent, workspace: Workspace) -> Outcome | None:
         if intent.loose:
             return None
         raise
+    except Elsewhere:
+        # "What does docker compose do" is a question, not a file request; a
+        # loose phrasing earns the subfolder offer only with an extension.
+        if intent.loose and not _FILE_NAME.match(intent.arg):
+            return None
+        raise
 
 
 def _run(intent: Intent, workspace: Workspace) -> Outcome:
@@ -241,3 +262,61 @@ def _run(intent: Intent, workspace: Workspace) -> Outcome:
                 "VS Code, Gmail, YouTube, GitHub, or one of your folders."
             ) from None
     raise ValueError(f"unknown action {intent.action!r}")
+
+
+# ----- follow-ups ---------------------------------------------------------
+
+_ORDINALS = {"first": 0, "1st": 0, "former": 0, "second": 1, "2nd": 1, "latter": 1, "other": 1, "last": 1}
+_YES = {"yes", "yeah", "yep", "sure", "ok", "okay"}
+_NO = {"no", "not", "nope", "nah", "don't", "doesn't", "wrong", "neither", "never"}
+# Words an answer may carry around the choice itself: "yes, the one in work".
+_ANSWER_FILLER = _YES | {"the", "one", "in", "i", "meant", "mean", "that", "please"}
+MAX_ANSWER_WORDS = 6
+
+
+def pick_option(text: str, options: list[Path]) -> Path | None:
+    """The option an answer to "did you mean X or Y?" (or "want that one?") picks, or None.
+
+    Only short answers count: "yes", "the first one", "the other", the
+    option's name ("voice input"), or, when both share a name, its folder
+    ("the one in work"). Anything else ("go to downloads", "the first time I
+    ran it") returns None and is handled as a fresh request.
+    """
+    words = _prepare(text).split()
+    if not words or len(words) > MAX_ANSWER_WORDS or _NO & set(words):
+        return None
+    rest = [w for w in words if w not in _ANSWER_FILLER]
+    if not rest:
+        return options[0] if len(options) == 1 else None  # "yes", "that one"
+    if len(rest) == 1 and rest[0] in _ORDINALS and _ORDINALS[rest[0]] < len(options):
+        return options[_ORDINALS[rest[0]]]
+    key = _normalize("".join(rest))
+    same_name = len({o.name.lower() for o in options}) < len(options)
+    labels = [o.parent.name if same_name else o.name for o in options]
+    named = [o for o, label in zip(options, labels) if key in (_normalize(label), _normalize(Path(label).stem))]
+    return named[0] if len(named) == 1 else None
+
+
+# A question about the file just explained: "what else does it do?", "tell me
+# more about the code". Anchored to the file on purpose; "what time is it"
+# must stay small talk.
+_REFERS_BACK = re.compile(
+    r"\b(?:what else|tell me more|explain more|go on|keep going)\b"
+    r"|\b(?:it|that|this) (?:do|does|say|says|mean|means|contain|contains|for)\b"
+    r"|\b(?:does|is|was) (?:it|that|this) (?:do|say|for|used|work|written)\b"
+    r"|\b(?:the|that|this) (?:file|code|function|script)\b"
+    r"|\b(?:about|in|explain) (?:it|that) again\b|\bmore about (?:it|that)\b"
+)
+
+
+def refers_back(text: str) -> bool:
+    """A question about the last file — and not naming a different one."""
+    prepared = _prepare(text)
+    return bool(_REFERS_BACK.search(prepared)) and not _FILE_NAME.match(prepared)
+
+
+def open_path(workspace: Workspace, path: Path) -> Outcome:
+    """Enter a folder or read a file that was picked from a "did you mean" list."""
+    if path.is_dir():
+        return Outcome(workspace.enter(path), explain=False)
+    return Outcome(workspace.read(path), explain=True)

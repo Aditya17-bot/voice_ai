@@ -5,7 +5,6 @@ back. No Ollama needed.
 Run: python -m unittest tests.test_classifier
 """
 
-import contextlib
 import tempfile
 import time
 import unittest
@@ -16,6 +15,7 @@ from assistant.classifier import NAME_BUDGET_CHARS, classify_request, showable_n
 from assistant.main import Assistant
 from assistant.router import Intent, might_be_command
 from assistant.tools import Workspace
+from tests.fakes import FakeBrain, FakeFallback, FakePlayer, FakeTTS
 
 
 def _choice(action: str, target: str = "none") -> dict:
@@ -172,53 +172,6 @@ class ShownNamesTest(unittest.TestCase):
             brain.classify.return_value = answer
             with self.subTest(answer=answer):
                 self.assertIsNone(classify_request(brain, self.ws, "Open evil dot example."))
-
-
-# ----- assistant flow with fakes ---------------------------------------
-
-
-class FakeBrain:
-    """Scripted classifier answers and replies; records what each call carried."""
-
-    def __init__(self, choice: str, *replies: list[str]) -> None:
-        self.choice = choice
-        self.replies = list(replies)
-        self.classified: list[str] = []
-        self.streamed: list[dict] = []
-
-    def classify(self, instructions, text, schema):
-        self.classified.append(text)
-        return {"choice": self.choice}
-
-    def stream_reply(self, text, context=None):
-        self.streamed.append({"text": text, "context": context})
-        yield from self.replies.pop(0)
-
-
-class FakeTTS:
-    def synthesize(self, text):
-        return text, 22050
-
-
-class FakePlayer:
-    def __init__(self) -> None:
-        self.said: list[str] = []
-
-    def enqueue(self, audio, rate) -> None:
-        self.said.append(audio)
-
-
-class FakeFallback:
-    def __init__(self) -> None:
-        self.watchdogs = 0
-
-    @contextlib.contextmanager
-    def watchdog(self):
-        self.watchdogs += 1
-        yield unittest.mock.Mock()
-
-    def speak_recovery(self) -> None:
-        raise AssertionError("no recovery expected")
 
 
 class AssistantFlowTest(unittest.TestCase):

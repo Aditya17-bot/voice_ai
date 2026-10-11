@@ -26,6 +26,7 @@ import os
 import re
 import stat
 import subprocess
+import time
 import webbrowser
 from pathlib import Path
 from typing import Callable
@@ -33,6 +34,7 @@ from typing import Callable
 MAX_READ_BYTES = 4_000  # ~1.2k tokens: fits num_ctx 2048 with the prompt and a short history
 README_PREVIEW_BYTES = 2_000
 MAX_LIST_ENTRIES = 15  # names spoken per listing; the rest become a count
+SUBFOLDER_SEARCH_SECONDS = 0.15  # when a file isn't here, how long to look one level down
 MATCH_CUTOFF = 0.75  # fuzzy-match floor for spoken names
 EXACT_CUTOFF = 0.98  # name or stem equal after normalizing
 PREFIX_SCORE = 0.85  # "voice" -> voice_input
@@ -110,6 +112,18 @@ class NotFound(ToolError):
     """No folder or file matched the spoken name."""
 
 
+class Ambiguous(ToolError):
+    """Two entries matched about equally; the message asks which one."""
+
+    def __init__(self, message: str, options: list[Path]) -> None:
+        super().__init__(message)
+        self.options = options
+
+
+class Elsewhere(Ambiguous):
+    """Not here, but a subfolder has it; the message offers it."""
+
+
 def default_roots() -> dict[str, Path]:
     """The folders the assistant may browse: C:\\adi, Desktop, Downloads."""
     home = Path.home()
@@ -165,12 +179,30 @@ def _best_match(query: str, entries: list[Path], cutoff: float = MATCH_CUTOFF) -
     if len(scored) > 1 and scored[0][0] - scored[1][0] < AMBIGUITY_MARGIN:
         first, second = scored[0][1], scored[1][1]
         if first.name.lower() == second.name.lower():  # same name, different parents
-            raise ToolError(
+            raise Ambiguous(
                 f"Did you mean {first.name} in {first.parent.name}, "
-                f"or in {second.parent.name}?"
+                f"or in {second.parent.name}?",
+                [first, second],
             )
-        raise ToolError(f"Did you mean {first.name} or {second.name}?")
+        raise Ambiguous(f"Did you mean {first.name} or {second.name}?", [first, second])
     return scored[0][1]
+
+
+def _word_runs(utterance: str, longest: int = 4) -> set[str]:
+    """Normalized runs of up to `longest` consecutive words: 'voice in put' -> 'voiceinput'."""
+    words = [w for w in (_normalize(w) for w in utterance.split()) if w and w != "dot"]
+    return {
+        "".join(words[i:j])
+        for i in range(len(words))
+        for j in range(i + 1, min(i + longest, len(words)) + 1)
+    }
+
+
+def named_in(name: str, utterance: str) -> bool:
+    """Whole words of the utterance spell the name or its stem: 'the read me' names README.md."""
+    runs = _word_runs(utterance)
+    keys = {_normalize(name), _normalize(Path(name).stem)}
+    return any(len(key) >= 2 and key in runs for key in keys)
 
 
 def resolve_app(name: str) -> str | None:
@@ -274,11 +306,12 @@ class Workspace:
     # ----- path safety -------------------------------------------------
 
     def _guard(self, path: Path) -> Path:
-        """Resolve path and require it inside an allowed root, not sensitive."""
+        """Resolve path and require it inside an allowed root, not hidden or sensitive."""
         resolved = path.resolve()
         for root in self._roots.values():
             if resolved == root or resolved.is_relative_to(root):
-                if any(_is_sensitive(part) for part in resolved.relative_to(root).parts):
+                # Hidden too: .git/config, .npmrc and friends can hold tokens.
+                if any(_is_hidden(part) for part in resolved.relative_to(root).parts):
                     raise ToolError("That one's private, so I'll leave it alone.")
                 return resolved
         raise ToolError("That's outside the folders I'm allowed to look at.")
@@ -360,7 +393,14 @@ class Workspace:
             target = _best_match(name, subfolders)
         if target is None:
             raise NotFound(f"I couldn't find a folder called {name}.")
-        self.cwd = self._guard(target)
+        return self.enter(target)
+
+    def enter(self, folder: Path) -> str:
+        """Move into a folder already found (e.g. picked after "did you mean")."""
+        target = self._guard(folder)
+        if not target.is_dir():
+            raise ToolError(f"{folder.name} isn't a folder.")
+        self.cwd = target
         return f"Now in {self.where()}."
 
     def list_folder(self) -> str:
@@ -399,8 +439,62 @@ class Workspace:
         _, files = self._entries(self.cwd)
         target = _best_match(name, files, cutoff=EXACT_CUTOFF if exact else MATCH_CUTOFF)
         if target is None:
+            nearby = self._files_one_level_down(name)
+            if len(nearby) == 1:
+                found = nearby[0]
+                raise Elsewhere(
+                    f"{found.name} isn't here, but there's one in {found.parent.name}. "
+                    "Want that one?",
+                    nearby,
+                )
+            if nearby:
+                raise Elsewhere(
+                    f"{nearby[0].name} isn't here. Did you mean the one in "
+                    f"{nearby[0].parent.name}, or in {nearby[1].parent.name}?",
+                    nearby[:2],
+                )
             raise NotFound(f"I couldn't find a file called {name} here.")
-        text, truncated = self._read_text(self._guard(target), MAX_READ_BYTES)
+        return self.read(target)
+
+    def _files_one_level_down(self, name: str) -> list[Path]:
+        """Exact-name matches in the subfolders here ("main.py" asked for in the project root).
+
+        Plain name comparison, no fuzzy scoring, within a time budget: a miss
+        in a crowded folder must not stall the reply.
+        """
+        key = _normalize(_clean_query(name))
+        if len(key) < 2:
+            return []
+        deadline = time.perf_counter() + SUBFOLDER_SEARCH_SECONDS
+        found = []
+        for sub in self._entries(self.cwd)[0]:
+            if time.perf_counter() > deadline:
+                break
+            try:
+                with os.scandir(sub) as it:
+                    names = [entry.name for entry in it]
+            except OSError:
+                continue
+            hits = [
+                n for n in names
+                if not _is_hidden(n) and key in (_normalize(n), _normalize(Path(n).stem))
+            ]
+            if len(hits) != 1:
+                continue  # none, or unclear even within one folder: don't offer it
+            try:
+                path = self._guard(sub / hits[0])
+            except ToolError:
+                continue
+            if path.is_file():
+                found.append(path)
+        return found
+
+    def read(self, file: Path) -> str:
+        """Text of a file already found (e.g. picked after "did you mean")."""
+        target = self._guard(file)
+        if not target.is_file():
+            raise ToolError(f"{file.name} isn't a file.")
+        text, truncated = self._read_text(target, MAX_READ_BYTES)
         note = " (only the beginning — the file is longer)" if truncated else ""
         return f"Contents of {target.name}{note}:\n{text}"
 

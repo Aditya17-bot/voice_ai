@@ -23,11 +23,10 @@ Safety model (the LLM now chooses actions):
 """
 
 import re
-from pathlib import PurePath
 
 from .brain import Brain
 from .router import Intent
-from .tools import SITES, Workspace, _normalize, resolve_app, resolve_site
+from .tools import SITES, Workspace, named_in, resolve_app, resolve_site
 
 ACTIONS = [
     "none",
@@ -87,21 +86,6 @@ def _said(pattern: str, utterance: str) -> bool:
     return re.search(rf"\b(?:{pattern})\b", utterance.lower()) is not None
 
 
-def _word_runs(utterance: str, longest: int = 4) -> set[str]:
-    """Normalized runs of up to `longest` consecutive words: 'voice in put' -> 'voiceinput'."""
-    words = [w for w in (_normalize(w) for w in utterance.split()) if w and w != "dot"]
-    return {
-        "".join(words[i:j])
-        for i in range(len(words))
-        for j in range(i + 1, min(i + longest, len(words)) + 1)
-    }
-
-
-def _named(name: str, utterance: str) -> bool:
-    """Whole words of the utterance spell the name or its stem: 'the read me' names README.md."""
-    runs = _word_runs(utterance)
-    keys = {_normalize(name), _normalize(PurePath(name).stem)}
-    return any(len(key) >= 2 and key in runs for key in keys)
 
 
 def showable_names(workspace: Workspace, utterance: str) -> tuple[list[str], list[str]]:
@@ -111,7 +95,7 @@ def showable_names(workspace: Workspace, utterance: str) -> tuple[list[str], lis
     budget = NAME_BUDGET_CHARS
     candidates = [(0, n) for n in folders] + [(1, n) for n in files]
     # Names the utterance mentions first, then the rest alphabetically.
-    candidates.sort(key=lambda kind_name: not _named(kind_name[1], utterance))
+    candidates.sort(key=lambda kind_name: not named_in(kind_name[1], utterance))
     for kind, name in candidates:
         if not _SHOWABLE_NAME.fullmatch(name) or len(name) + 2 > budget:
             continue
@@ -153,7 +137,7 @@ def to_intent(choice: dict, utterance: str) -> Intent | None:
             return None  # names only, never paths
         if action == "go_to_folder" and target.lower() == "up":
             return Intent("go_to_folder", "up") if _said(_UP_WORDS, utterance) else None
-        return Intent(action, target, loose=True) if _named(target, utterance) else None
+        return Intent(action, target, loose=True) if named_in(target, utterance) else None
     if not _said(_ACTION_WORDS[action], utterance):
         return None
     return Intent("where" if action == "where_am_i" else action)

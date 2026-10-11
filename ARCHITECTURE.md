@@ -64,7 +64,20 @@ Measured on the dev machine (RTX 3050 Laptop 4 GB, llama3.2:3b, `num_ctx` 2048):
 | TTS first sentence (Piper) | ~200 ms | ~100–540 ms |
 | LLM + TTS to first audio | — | **mean ~1.34 s** |
 
-The filler covers the case where the LLM stage blows its budget.
+Desktop actions, measured from the end of the transcript (add VAD + STT):
+
+| Path | First word |
+|---|---|
+| Regex fast path (open, go to, list) | ~0.1–0.3 s |
+| Classifier picks an action | ~0.6–0.7 s |
+| Explain a file (fast path / via classifier) | ~1.3 s / ~2.1 s |
+| Classifier says "just talk", then a reply | ~1.6 s |
+| "Want that one?" offer / "Yes" then explanation | ~0.2 s / ~1.8 s |
+| Follow-up question about the last file | ~1.5 s |
+
+Explaining a file through the classifier takes two LLM calls and runs a
+little over budget; the filler covers it. The filler covers any case where
+the LLM stage blows its budget.
 
 Hard-won latency notes:
 - **Use `127.0.0.1`, never `localhost`**, for the Ollama URL — on Windows the
@@ -83,6 +96,68 @@ Hard-won latency notes:
 - Reliable with headphones; on open laptop speakers the bot can occasionally
   trigger on itself (no echo cancellation — accepted simplicity tradeoff).
 
+### 8. Desktop actions — read-only (`tools.py`, `router.py`, `classifier.py`)
+
+The assistant can open a few apps and sites and browse, list, and explain
+folders and files. It can **never write, delete, move, or run anything**.
+
+**What it can touch**
+- Folders: `C:\adi`, Desktop (OneDrive Desktop if present), Downloads.
+  Every path is resolved and must stay inside one of them; links leading
+  outside are hidden. Dot-folders like `.git` and clutter like
+  `node_modules` can't be entered or read. Secrets (`.env`, `.ssh`, keys, `*credential*`, …) are
+  invisible, and private-key text is refused even under an innocent name.
+- Apps: Chrome, Windows Terminal (or PowerShell), VS Code, launched by
+  absolute path with an argument list, never through a shell.
+- Sites: Gmail, YouTube, GitHub. There is no "open any URL", so nothing can
+  be sent anywhere.
+
+**How an utterance is handled**
+
+```
+utterance
+  ├─ short answer to "did you mean X or Y?" / "want that one?" ──► open it
+  │    ("yes", "the first one", "voice input"; anything else is a new request)
+  ├─ follow-up on the file just explained ──► grounded reply
+  ├─ regex fast path (router.py) ─────► act, ~0.1–0.3 s
+  │    explicit ("cd tests", "read main.py"): fuzzy names, say if missing
+  │    loose ("go to X", "explain X"): exact names only, else fall through
+  ├─ sounds like a desktop request? ──► LLM classifier (classifier.py)
+  │    one constrained-JSON call, ~0.27 s: pick one option from a menu
+  │    ("open gmail", "go to tests", "read main.py", "none"), then check the
+  │    choice is backed by the user's words; otherwise just talk
+  └─ conversation ────────────────────► streamed LLM reply
+```
+
+Reading a file or folder doesn't speak its text: the text goes to the LLM
+between `<<<DATA>>>` markers, marked as data rather than instructions, and
+the LLM explains it in a few sentences. A follow-up anchored to that file
+("what else does it do?", "tell me more about the code") in the next two
+turns reuses the text; small talk with "it" ("what time is it?") doesn't.
+Any other action (moving, listing, opening an app) or an error ends the
+thread.
+
+If a file isn't in the current folder but exactly one subfolder has it,
+the assistant offers it ("main.py isn't here, but there's one in
+assistant. Want that one?"). The search compares names only, skips hidden
+and private entries, and gives up after 0.15 s. A loosely phrased question
+gets the offer only if the name has an extension, so "what does docker
+compose do?" stays a general question.
+
+**Why the LLM classifies instead of calling tools.** With native tool
+calling, llama3.2:3b called a tool on most chit-chat that passed the gate
+("go to sleep" → open Desktop). The classifier's output is limited by
+Ollama to one menu entry, so it can't invent a file name or a URL, and
+nothing it writes is spoken. It sees only the utterance and the names here,
+with no history and no file text, so a file can't steer an action. A choice
+is still dropped unless the user named the target in whole words, used an
+opening verb for apps and sites, and didn't say "don't" or "later".
+qwen3:4b was tried and rejected: the local build ignores `think: false` and
+spends 6–49 s reasoning.
+
+Measured with `python -m tests.eval_classifier` (llama3.2:3b): 27/29 on the
+tuning set, 18/20 on a held-out set, 0 wrong actions on either.
+
 ## Phases (all complete)
 
 1. **Echo bot** — mic → VAD → STT → TTS → speaker. Proves the audio loop.
@@ -91,6 +166,14 @@ Hard-won latency notes:
 4. **Fallback** — filler watchdog, canned responses, no generic errors.
 5. **Polish** — barge-in (interrupt TTS when user speaks), history trimming,
    model-size tuning.
+6. **Desktop tools** — read-only sandboxed folder browsing, file reading,
+   allowlisted apps and sites; `--text` mode for typed testing.
+7. **Fast path** — regex router for common commands; grounded explanations
+   of files and folders.
+8. **LLM fallback** — constrained-JSON classifier for requests the router
+   misses, with word-backing checks.
+9. **Conversation polish** — answering "did you mean", follow-up questions
+   about the last file, names spoken naturally ("main dot py").
 
 ## Non-goals
 

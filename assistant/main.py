@@ -16,6 +16,8 @@ import functools
 import re
 import sys
 import time
+from pathlib import Path
+from typing import Callable
 
 from .audio_io import Microphone, Player
 
@@ -25,9 +27,18 @@ if hasattr(sys.stdout, "reconfigure"):
 from .brain import Brain
 from .classifier import classify_request
 from .fallback import FallbackEngine, Watchdog
-from .router import Intent, execute, might_be_command, route
+from .router import (
+    Intent,
+    Outcome,
+    execute,
+    might_be_command,
+    open_path,
+    pick_option,
+    refers_back,
+    route,
+)
 from .stt import SpeechToText
-from .tools import APP_LABELS, SITES, ToolError, Workspace
+from .tools import APP_LABELS, SITES, Ambiguous, ToolError, Workspace
 from .tts import TextToSpeech
 from .vad import UtteranceDetector
 
@@ -37,8 +48,23 @@ COMMON_CONFIRMATIONS = [
     *(f"Opening {label}." for label, _url in SITES.values()),
 ]
 CACHE_MAX_CHARS = 80  # only short, repeatable phrases are worth keeping as audio
+FOLLOWUP_TURNS = 2  # turns after a file explanation that can still ask about it
 # Sentence ends followed by a space; "README.md," stays whole.
 _SENTENCE_BREAK = re.compile(r"(?<=[.!?])\s+")
+_DUNDER = re.compile(r"\b__(\w+?)__")
+_UNDERSCORE = re.compile(r"(?<=[A-Za-z0-9])_+(?=[A-Za-z0-9])")
+# Two word characters before the dot, so "e.g.", "a.m." and "U.S.A." stay
+# abbreviations; a letter after it, so "3.5" stays a number.
+_EXTENSION_DOT = re.compile(r"(?<=\w\w)\.(?=[A-Za-z][A-Za-z0-9]{0,4}\b)")
+
+
+def speakable(text: str) -> str:
+    """How text should sound: 'voice_input' -> 'voice input', 'main.py' -> 'main dot py'.
+
+    Only what's spoken changes; the printed text keeps the real names.
+    """
+    text = _DUNDER.sub(r"dunder \1", text)
+    return _EXTENSION_DOT.sub(" dot ", _UNDERSCORE.sub(" ", text))
 
 
 class Assistant:
@@ -58,14 +84,37 @@ class Assistant:
         self._tts = tts
         self._fallback = fallback
         self._workspace = workspace
+        self._turn = 0
+        # Options from the last "did you mean X or Y?", with the request that asked.
+        self._pending: tuple[list[Path], str] | None = None
+        # Text of the last file or folder explained, for follow-up questions.
+        self._followup: str | None = None
+        self._followup_turn = 0
         # Short tool confirmations repeat a lot; cache their audio.
         self._synthesize_cached = functools.lru_cache(maxsize=64)(tts.synthesize)
         for phrase in COMMON_CONFIRMATIONS:
             self._synthesize_cached(phrase)
 
     def respond(self, text: str, started_at: float) -> None:
+        self._turn += 1
         if self._workspace is None:
             self._stream(text, started_at)
+            return
+        pending, self._pending = self._pending, None
+        if pending is not None:
+            options, asked_for = pending
+            choice = pick_option(text, options)
+            if choice is not None:
+                print(f"   [picked {choice.name}]")
+                # Explain with the original request, not "the first one".
+                self._perform(lambda: open_path(self._workspace, choice), asked_for, started_at)
+                return
+        recent = self._turn - self._followup_turn <= FOLLOWUP_TURNS
+        if self._followup is not None and recent and refers_back(text):
+            # Checked before routing: "explain that again" is about the last
+            # file, not a request for a file named "that".
+            print("   [follow-up on the last file or folder]")
+            self._stream(text, started_at, context=self._followup)
             return
         intent = route(text)
         if intent is not None:
@@ -80,20 +129,35 @@ class Assistant:
 
     def _act(self, intent: Intent, text: str, started_at: float) -> bool:
         """Run an intent and say the result. False: nothing matched, nothing said."""
+        return self._perform(lambda: execute(intent, self._workspace), text, started_at)
+
+    def _perform(
+        self, action: Callable[[], Outcome | None], text: str, started_at: float
+    ) -> bool:
+        """Run a tool action and say the result. False: nothing matched, nothing said."""
         try:
-            outcome = execute(intent, self._workspace)
+            outcome = action()
+        except Ambiguous as exc:
+            self._followup = None  # asked about something else
+            self._pending = (exc.options, text)  # the next answer can pick one
+            self._speak(str(exc), started_at)
+            return True
         except ToolError as exc:
+            self._followup = None
             self._speak(str(exc), started_at)
             return True
         except Exception as exc:  # noqa: BLE001 — e.g. Popen failing; keep the session alive
+            self._followup = None
             print(f"   (action failed: {type(exc).__name__}: {exc})")
             self._speak("Sorry, that didn't work. Want to try something else?", started_at)
             return True
         if outcome is None:
             return False
         if outcome.explain:
+            self._followup, self._followup_turn = outcome.text, self._turn
             self._stream(text, started_at, context=outcome.text)
         else:
+            self._followup = None  # moved on: a new folder, a listing, an app
             self._speak(outcome.text, started_at)
         return True
 
@@ -119,10 +183,11 @@ class Assistant:
     def _speak(self, text: str, started_at: float) -> None:
         """Say fixed text (tool confirmation, listing, or refusal) sentence by sentence."""
         for i, sentence in enumerate(_SENTENCE_BREAK.split(text)):
-            if len(sentence) <= CACHE_MAX_CHARS:
-                audio, rate = self._synthesize_cached(sentence)
+            spoken = speakable(sentence)
+            if len(spoken) <= CACHE_MAX_CHARS:
+                audio, rate = self._synthesize_cached(spoken)
             else:
-                audio, rate = self._tts.synthesize(sentence)
+                audio, rate = self._tts.synthesize(spoken)
             self.player.enqueue(audio, rate)
             print(f"   Bot: {sentence}")
             if i == 0:
@@ -146,7 +211,7 @@ class Assistant:
             dog = contextlib.nullcontext(watchdog) if watchdog else self._fallback.watchdog()
             with dog as watchdog:
                 for sentence in self._brain.stream_reply(text, context=context):
-                    audio, rate = self._tts.synthesize(sentence)
+                    audio, rate = self._tts.synthesize(speakable(sentence))
                     watchdog.cancel()
                     if first_word_ms is None:
                         first_word_ms = (time.perf_counter() - started_at) * 1000

@@ -13,6 +13,10 @@ recognition, language model, and speech synthesis all run on your machine.
   the model stalls — never a generic error message
 - ✋ Barge-in: speak over the bot and it stops and listens (best with
   headphones — open speakers can leak the bot's voice into the mic)
+- 🗂️ Read-only desktop help: open Chrome, the terminal, VS Code, Gmail,
+  YouTube or GitHub; move between folders in `C:\adi`, Desktop and Downloads;
+  list them; explain a folder or file. It never writes, deletes or runs
+  anything.
 
 ## Requirements
 
@@ -41,6 +45,27 @@ python -m assistant.main
 Speak when you see `🎤 Listening…`. Pause, and the assistant answers out loud.
 Press `Ctrl+C` to exit.
 
+To type instead of talking (replies are still spoken):
+
+```powershell
+python -m assistant.main --text
+```
+
+Things to try:
+
+- "Open Chrome." / "Open Gmail." / "Open a terminal here."
+- "Go to the voice input folder." / "Go up." / "Where am I?"
+- "What's in this folder?" / "Explain this project."
+- "What does main.py do?" — then "What else does it do?"
+- "cd voice" — if two folders match, it asks which; answer "the first one".
+
+## Tests
+
+```powershell
+python -m unittest tests.test_tools tests.test_router tests.test_classifier tests.test_conversation
+python -m tests.eval_classifier   # live check of the LLM classifier (needs Ollama)
+```
+
 ## How it works
 
 ```
@@ -61,5 +86,6 @@ were done by the author. See `AI_USE.md` for details.
 
 ## Project status
 
-Built in 5 phases: echo bot → brain → streaming → fallback → polish.
+Built in 9 phases: echo bot → brain → streaming → fallback → polish →
+desktop tools → fast path → LLM fallback → conversation polish.
 Each phase is reviewed before the next begins.

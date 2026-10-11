@@ -29,6 +29,10 @@ import requests
 
 from . import credentials, github, gmail
 
+# Windows consoles default to cp1252, which can't print ✓ / ✗.
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
 AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
 REVOKE_URL = "https://oauth2.googleapis.com/revoke"
 SIGN_IN_TIMEOUT_S = 300

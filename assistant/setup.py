@@ -1,6 +1,7 @@
 """One-time account setup for read-only Gmail and GitHub.
 
     python -m assistant.setup gmail path\\to\\client_secret.json
+    python -m assistant.setup gmail          (sign in again, same client)
     python -m assistant.setup github
     python -m assistant.setup status
     python -m assistant.setup forget gmail|github
@@ -84,12 +85,19 @@ def _sign_in(state: str, open_browser) -> tuple[str, str]:
     return result["code"], redirect_uri
 
 
-def setup_gmail(client_file: str) -> None:
-    try:
-        client = json.loads(Path(client_file).read_text(encoding="utf-8"))["installed"]
-        client_id, client_secret = client["client_id"], client["client_secret"]
-    except (OSError, ValueError, KeyError):
-        _fail("That isn't a Desktop-app OAuth client file (client_secret_….json, with an 'installed' section).")
+def setup_gmail(client_file: str | None) -> None:
+    if client_file is None:
+        # Signing in again: reuse the client from the last setup.
+        saved = credentials.load(gmail.SECRET_NAME)
+        if saved is None:
+            _fail("No saved Gmail setup yet. Give the client_secret_….json file the first time.")
+        client_id, client_secret = saved["client_id"], saved["client_secret"]
+    else:
+        try:
+            client = json.loads(Path(client_file).read_text(encoding="utf-8"))["installed"]
+            client_id, client_secret = client["client_id"], client["client_secret"]
+        except (OSError, ValueError, KeyError):
+            _fail("That isn't a Desktop-app OAuth client file (client_secret_….json, with an 'installed' section).")
     verifier = secrets.token_urlsafe(64)
     challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()
     state = secrets.token_urlsafe(16)
@@ -157,8 +165,8 @@ def status() -> None:
 
 
 def main(argv: list[str]) -> None:
-    if len(argv) >= 2 and argv[0] == "gmail":
-        setup_gmail(argv[1])
+    if argv[:1] == ["gmail"]:
+        setup_gmail(argv[1] if len(argv) >= 2 else None)
     elif argv[:1] == ["github"]:
         setup_github()
     elif argv[:1] == ["status"]:

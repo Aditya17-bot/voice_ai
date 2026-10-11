@@ -182,7 +182,7 @@ class WorkspaceTest(unittest.TestCase):
     def test_open_app_aliases(self) -> None:
         with mock.patch.object(tools, "_find_chrome", return_value="chrome.exe"):
             self.assertEqual(self.ws.open_app("Google Chrome"), "Opening Chrome.")
-        self.assertEqual(self.launched[-1][0], ["chrome.exe"])
+        self.assertEqual(self.launched[-1][0], ["chrome.exe", "--profile-directory=Default"])
 
     def test_explorer_not_allowed(self) -> None:
         with self.assertRaises(ToolError):
@@ -217,6 +217,54 @@ class WorkspaceTest(unittest.TestCase):
             self.assertEqual(self.ws.open_website("G mail"), "Opening Gmail.")
             self.assertEqual(self.ws.open_website("youtube.com"), "Opening YouTube.")
         self.assertEqual(self.urls, ["https://mail.google.com", "https://www.youtube.com"])
+
+    def test_search_encodes_the_query(self) -> None:
+        with mock.patch.object(tools, "_find_chrome", return_value="chrome.exe"):
+            said = self.ws.search("youtube", "lofi & chill?  music")
+        self.assertEqual(said, "Searching YouTube for lofi & chill? music.")
+        self.assertEqual(
+            self.launched[-1][0],
+            ["chrome.exe", "--profile-directory=Default", "https://www.youtube.com/results?search_query=lofi+%26+chill%3F+music"],
+        )
+
+    def test_search_only_known_sites_and_bounded_query(self) -> None:
+        with self.assertRaises(ToolError):
+            self.ws.search("evil.example", "x")
+        with self.assertRaises(ToolError):
+            self.ws.search("google", "   ")
+        with mock.patch.object(tools, "_find_chrome", return_value=None):
+            self.ws.search("google", "a" * 500)
+        self.assertEqual(len(self.urls[-1]), len("https://www.google.com/search?q=") + tools.MAX_QUERY_CHARS)
+
+    def test_chrome_profile_by_name(self) -> None:
+        profiles = {
+            "Default": ["Aditya", "Aditya"],
+            "Profile 2": ["Robert", "Robert"],
+            "Profile 4": ["Aditya", "Aditya"],
+            "Profile 6": ["vitstudent.ac.in"],
+            "Profile 7": ["vitstudent.ac.in", "Aditya", "Aditya Sridhar"],
+        }
+        self.ws._profiles = lambda: profiles
+        resolve = lambda name: tools.resolve_chrome_profile(name, profiles)  # noqa: E731
+        self.assertEqual(resolve("robert"), "Profile 2")
+        self.assertEqual(resolve("Aditya"), "Default")  # exactly the usual one's name
+        self.assertEqual(resolve("aditya sridhar"), "Profile 7")  # full name is exact
+        self.assertEqual(resolve("profile 4"), "Profile 4")  # folder names work too
+        with self.assertRaises(ToolError) as caught:
+            resolve("vit")  # two VIT profiles, neither the usual one
+        self.assertIn("Profile 6 or Profile 7", str(caught.exception))
+        with self.assertRaises(ToolError):
+            resolve("adit")  # a prefix tie never quietly picks the usual one
+        with self.assertRaises(ToolError) as caught:
+            resolve("bob")
+        self.assertIn("Robert", str(caught.exception))
+        with mock.patch.object(tools, "_find_chrome", return_value="chrome.exe"):
+            self.assertEqual(self.ws.open_app("chrome", "robert"), "Opening Chrome as robert.")
+            self.ws.open_website("gmail", "robert")
+        self.assertEqual(self.launched[-2][0], ["chrome.exe", "--profile-directory=Profile 2"])
+        self.assertEqual(self.launched[-1][0], ["chrome.exe", "--profile-directory=Profile 2", "https://mail.google.com"])
+        with self.assertRaises(ToolError):
+            self.ws.open_app("terminal", "robert")
 
     def test_other_urls_refused(self) -> None:
         # Arbitrary URLs would let text read from a file make the model send

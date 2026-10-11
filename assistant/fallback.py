@@ -118,21 +118,26 @@ class Watchdog:
     def __init__(self, engine: FallbackEngine) -> None:
         self._engine = engine
         self._done = threading.Event()
+        # Held while deciding to play a filler, so one can't start after cancel().
+        self._lock = threading.Lock()
         self._thread = threading.Thread(target=self._run, daemon=True)
 
     def _run(self) -> None:
-        if self._done.wait(FIRST_FILLER_AFTER_S):
-            return
-        self._engine.play_filler()
-        while not self._done.wait(NEXT_FILLER_EVERY_S):
-            self._engine.play_filler()
+        wait = FIRST_FILLER_AFTER_S
+        while not self._done.wait(wait):
+            with self._lock:
+                if self._done.is_set():
+                    return
+                self._engine.play_filler()
+            wait = NEXT_FILLER_EVERY_S
 
     def __enter__(self) -> "Watchdog":
         self._thread.start()
         return self
 
     def cancel(self) -> None:
-        self._done.set()
+        with self._lock:
+            self._done.set()
 
     def __exit__(self, *exc) -> None:
         self.cancel()

@@ -87,14 +87,38 @@ Hard-won latency notes:
 - 1b vs 3b barely matters once fully on GPU (1.21 s vs 1.34 s mean first
   audio) — keep 3b for answer quality.
 
-### 7. Barge-in (`vad.py:monitor_barge_in`)
-- While the reply plays, the mic keeps being monitored.
-- Stricter than normal listening (probability ≥ 0.75 sustained 320 ms) because
-  the bot's own voice leaks from speakers into the mic.
-- On barge-in: `Player.stop()` flushes playback, and the captured speech
-  chunks seed the next `listen()` so the user's first words aren't lost.
-- Reliable with headphones; on open laptop speakers the bot can occasionally
-  trigger on itself (no echo cancellation — accepted simplicity tradeoff).
+### 7. Interrupting a reply
+- **In the window (default):** push-to-talk. Holding Space or the mic button
+  stops the reply and records; Esc or ■ Stop just stops. The mic stream stays
+  open, but audio is discarded unless the key is held (or hands-free is on and
+  the assistant is quiet), so the assistant never transcribes its own voice
+  or background talk.
+- **`--terminal --barge-in` (`vad.py:monitor_barge_in`):** the mic is watched
+  while the reply plays, at a stricter threshold (≥ 0.75 sustained 320 ms).
+  Only usable with headphones: in the first live test on laptop speakers, 13
+  of the replies were cut off by the bot's own voice. Off by default.
+- `Assistant.interrupt()` empties the player, cancels fillers, and makes the
+  turn drop the rest of the streamed reply.
+
+### Playback (`audio_io.Player`)
+One long-lived `sd.OutputStream` with a callback that pulls from a queue of
+clips. Sentences play back to back with no gap, `stop()` only empties the
+queue under a lock, and "done" is reported once the output latency has
+passed, so the mic drain that follows also drops the echo of the last word.
+The earlier player called `sd.play`/`sd.wait` per sentence and `sd.stop()`
+from another thread; that cross-thread use of sounddevice's global stream is
+the likely cause of a segfault (exit 139) in the first live test.
+`faulthandler` is on, so any further native crash prints a stack.
+
+### The window (`ui.py`, `face.py`)
+Plain tkinter, no extra dependency. Tk's main loop owns the widgets; a worker
+thread runs one request at a time (transcribe, then `Assistant.respond`) and
+a mic thread handles push-to-talk and hands-free listening. Both only talk
+to the window through a queue that the main loop polls every 30 ms. The face
+is a procedural circuit board whose pulses change with the state (idle,
+listening, thinking, speaking) and with the loudness of the voice. The idea
+of a face that idles, listens, thinks and speaks, and of holding a key to
+talk, comes from jaredrhod's fullstack-agent; the code is our own.
 
 ### 8. Desktop actions — read-only (`tools.py`, `router.py`, `classifier.py`)
 
@@ -111,6 +135,13 @@ folders and files. It can **never write, delete, move, or run anything**.
   absolute path with an argument list, never through a shell.
 - Sites: Gmail, YouTube, GitHub. There is no "open any URL", so nothing can
   be sent anywhere.
+- Searches: YouTube, GitHub and Google results pages. The query is the
+  user's own words, taken by the regex router and URL-encoded, capped at 120
+  characters. The LLM classifier has no search option, and file text never
+  reaches a query.
+- Chrome opens in a fixed profile (`Default`) so the profile picker never
+  shows; "open Chrome as <name>" picks another by the display name in
+  Chrome's `Local State` (read-only, names only).
 
 **How an utterance is handled**
 
@@ -174,8 +205,65 @@ tuning set, 18/20 on a held-out set, 0 wrong actions on either.
    misses, with word-backing checks.
 9. **Conversation polish** — answering "did you mean", follow-up questions
    about the last file, names spoken naturally ("main dot py").
+10. **Live-test fixes** — persistent output stream (gapless, no cross-thread
+    sounddevice calls), barge-in off by default, the model no longer claims
+    to have looked at files, "check X", spoken "stop" quits.
+11. **Window** — tkinter face, chat log, typing, push-to-talk, hands-free,
+    Stop.
+12. **Chrome profiles and search** — open Chrome as a named profile; search
+    YouTube, GitHub, Google with the user's own words.
+13. **Second live test's fixes, YouTube playing** — time and date, "what can
+    you do", "what's in the downloads folder", "the folder named X", video
+    requests search YouTube, push-to-talk keeps 0.3 s before the press,
+    Whisper `base.en`, and "play X on YouTube" / "play the second one".
+14. **Corner orb, Right Ctrl, voice console** — an always-on-top orb shows
+    the state over other apps; hold Right Ctrl from any window to talk; "go
+    hands free", "full screen", "change your face", "start over"; a second
+    face (radial orb).
+15. **Memory, Gmail, GitHub** — "remember that…" (the one write, to
+    `data/memory.json`); read-only Gmail and GitHub with server-enforced
+    read-only logins.
+
+### YouTube playing (`youtube.py`)
+The assistant can't click inside Chrome, so it reads YouTube's results page
+for the user's words (with `requests`, as a browser would), takes the video
+ids from the page's `ytInitialData`, and opens
+`https://www.youtube.com/watch?v=<id>`. Only youtube.com is fetched or
+opened, only ids matching `[A-Za-z0-9_-]{11}` are used, and titles are only
+spoken and shown. A search fetches its results in the background, so "play
+the second one" is instant; a direct "play X" takes 1–4 s and says "Looking
+for X" first. If YouTube's page layout changes, only the top id is trusted.
+The YouTube Data API would be the official route but needs an API key.
+
+### Accounts (`gmail.py`, `github.py`, `credentials.py`, `setup.py`)
+Gmail uses the `gmail.readonly` OAuth scope and GitHub a fine-grained
+read-only token, so the servers refuse any change. Setup refuses anything
+broader. Logins are DPAPI-encrypted in `%APPDATA%\voice_assistant`. Only GET
+requests are sent (plus Google's token refresh). Counts and lists (sender,
+subject, when) are spoken directly; an email body or a README goes to the LLM
+as delimited data in a tool-less turn, like a file, and follow-ups work the
+same way. Email and repo text never reaches the classifier or any action.
+
+### Time, weather (`clock.py`)
+Local time and date, and "what time is it in Tokyo", are worked out from the
+`tzdata` time-zone database (the 3B model got time-zone sums wrong). Weather
+can't be known offline, so "what's the weather in Paris" opens Google's
+answer for those words.
+
+### Right Ctrl talk key (`hotkey.py`)
+No keyboard hook: a thread polls `GetAsyncKeyState` for Right Ctrl every
+20 ms and starts recording after 200 ms held. While it's held, any other key
+or mouse button marks it as a shortcut (Ctrl+C, Ctrl+scroll), and the
+recording is dropped. Nothing is recorded or logged about other keys.
+
+Tried and dropped in phase 10: Whisper `hotwords` for app names. It fixed
+"search your tube", but silence then took ~23 s to transcribe and loud noise
+came out as "www.cf.com". Push-to-talk solved more of the mishearing.
 
 ## Non-goals
 
-- No GUI, no web server, no cloud calls.
-- No wake word (push-to-talk / always-listening loop is enough).
+- No web server, no cloud AI: speech, the model and the voice stay local.
+  The only network use is what the user asks for (opening sites, YouTube
+  results, their own Gmail and GitHub).
+- No wake word (push-to-talk is enough).
+- No typing into other apps: keystrokes could land in a terminal and run.

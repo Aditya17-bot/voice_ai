@@ -250,6 +250,25 @@ class ConversationTest(unittest.TestCase):
         self.assertIsNotNone(brain.streamed[2]["context"])  # two turns after
         self.assertIsNone(brain.streamed[3]["context"])  # three turns after
 
+    def test_interrupt_drops_the_rest_of_the_reply(self) -> None:
+        assistant = None
+
+        class InterruptedBrain(FakeBrain):
+            def stream_reply(self, text, context=None):
+                yield "First sentence."
+                assistant.interrupt()  # the user pressed Stop while it talked
+                yield "Second sentence."
+                yield "Third sentence."
+
+        self.player.stop = lambda: None
+        assistant = self._session(InterruptedBrain("none"))
+        assistant.respond("Tell me a story.", time.perf_counter())
+        self.assertEqual(self.player.said, ["First sentence."])
+        # The next request is answered normally.
+        assistant._brain = FakeBrain("none", ["Sure."])
+        assistant.respond("Tell me a joke.", time.perf_counter())
+        self.assertEqual(self.player.said[-1], "Sure.")
+
     def test_listing_is_spoken_with_friendly_names(self) -> None:
         assistant = self._session(FakeBrain("none"))
         self.ws.go_to_folder("voice input")

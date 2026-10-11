@@ -4,8 +4,6 @@ from pathlib import Path
 
 import numpy as np
 
-from . import audio_io
-
 MODELS_DIR = Path(__file__).resolve().parent.parent / "models" / "piper"
 DEFAULT_VOICE = "en_US-lessac-medium"
 
@@ -38,9 +36,3 @@ class TextToSpeech:
         if not chunks:
             return np.zeros(0, dtype=np.int16), sample_rate
         return np.concatenate(chunks), sample_rate
-
-    def speak(self, text: str) -> None:
-        """Synthesize and play, blocking until playback finishes."""
-        audio, sample_rate = self.synthesize(text)
-        if audio.size:
-            audio_io.play(audio, sample_rate)

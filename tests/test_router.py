@@ -8,7 +8,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from assistant.router import Intent, Outcome, execute, route
+from assistant.router import Intent, Outcome, execute, route, wants_to_quit
 from assistant.tools import ToolError, Workspace
 
 ROUTED = {
@@ -56,13 +56,94 @@ ROUTED = {
     "Read readme.": Intent("read_file", "readme", loose=True),
     # unknown "open X" resolved at execution time
     "Open voice input.": Intent("open_any", "voice input"),
-    "Start over.": Intent("open_any", "over", loose=True),
+    "Start over.": Intent("clear_chat"),
+    "Start the engine.": Intent("open_any", "engine", loose=True),
+    # voice console
+    "Go hands free.": Intent("ui", "hands_free_on"),
+    "Push to talk mode.": Intent("ui", "hands_free_off"),
+    "Clear the conversation.": Intent("clear_chat"),
+    "Full screen.": Intent("ui", "fullscreen_on"),
+    "Exit full screen.": Intent("ui", "fullscreen_off"),
+    "Change your face.": Intent("ui", "next_face"),
+    "Hide.": Intent("ui", "hide"),
+    "Come back.": Intent("ui", "show"),
+    # "check X"
+    "Check the patents folder.": Intent("go_to_folder", "patents folder", loose=True),
+    "Check my email.": Intent("open_website", "gmail"),
+    "Check out YouTube.": Intent("open_website", "youtube"),
+    "Check patents.": Intent("open_any", "patents", loose=True),
+    # searches: the query is the user's words
+    "Search YouTube for lofi music.": Intent("search", "lofi music", site="youtube"),
+    "Can you search for some rust tutorials on YouTube?": Intent("search", "rust tutorials", site="youtube"),
+    "Look up voice assistants on GitHub.": Intent("search", "voice assistants", site="github"),
+    "Google pasta recipes.": Intent("search", "pasta recipes", site="google"),
+    "Search for the best pizza near me.": Intent("search", "best pizza near me", site="google"),
+    # YouTube: play by search, pick from the last search
+    "Play Coldplay on YouTube.": Intent("play_video", "coldplay"),
+    "Open a music video on YouTube.": Intent("play_video", "music video"),
+    "Open on YouTube Clash Royale.": Intent("play_video", "clash royale"),
+    "Find an anime video.": Intent("search", "anime video", site="youtube"),
+    "Play some lofi music.": Intent("play_video", "lofi music"),
+    "Click on the first video.": Intent("pick_video", "1"),
+    "Play the second one.": Intent("pick_video", "2"),
+    "Open video number 3.": Intent("pick_video", "3"),
+    "Play the next one.": Intent("pick_video", "next"),
+    "The third one.": Intent("pick", "3", loose=True),
+    "Read the second one.": Intent("pick", "2"),
+    "Open the second one.": Intent("pick", "2"),
+    # memory
+    "Remember that my exam is on Friday.": Intent("remember", "my exam is on friday"),
+    "What do you remember about me?": Intent("recall"),
+    "Forget about my exam.": Intent("forget", "my exam"),
+    "Forget everything.": Intent("forget_all"),
+    # Gmail
+    "How many emails did I get today?": Intent("email_today"),
+    "Do I have any new emails?": Intent("email_unread"),
+    "What are my latest emails?": Intent("email_latest"),
+    "Read my unread emails.": Intent("email_latest", "unread"),
+    "Find the email from Amazon.": Intent("email_from", "amazon"),
+    "Did I get any emails from my professor today?": Intent("email_from", "my professor"),
+    "Any emails about the internship?": Intent("email_about", "the internship"),
+    "Read the latest email.": Intent("read_email", "latest"),
+    "Check the weather in Paris.": Intent("search", "weather paris", site="google"),
+    "Read the third email.": Intent("read_email", "3"),
+    # GitHub
+    "List my repos.": Intent("gh_repos"),
+    "What's new on my voice AI repo?": Intent("gh_new", "voice ai"),
+    "Any open issues on my voice AI repo?": Intent("gh_issues", "voice ai"),
+    "Any pull requests on the portfolio repo?": Intent("gh_pulls", "portfolio"),
+    "How many stars does my voice AI repo have?": Intent("gh_stats", "voice ai"),
+    "What's new on voice ai on GitHub?": Intent("gh_new", "voice ai"),
+    "What time is it in Tokyo?": Intent("time_in", "tokyo"),
+    "What's the weather in Paris?": Intent("search", "weather paris", site="google"),
+    "Will it rain tomorrow?": Intent("search", "weather", site="google"),
+    "Forget the conversation.": Intent("clear_chat"),
+    "What is my stonks repo about?": Intent("gh_readme", "stonks"),
+    "What are the videos?": Intent("list_videos"),
+    # a named folder, help, time
+    "Tell me what you see in downloads folder.": Intent("look_in", "downloads"),
+    "What's in my patents folder?": Intent("look_in", "patents"),
+    "What's in downloads?": Intent("look_in", "downloads", loose=True),
+    "List the files in the assistant folder.": Intent("look_in", "assistant"),
+    "Find the folder named Adi.": Intent("go_to_folder", "adi"),
+    "List of files.": Intent("list_folder"),
+    "What can you do?": Intent("help"),
+    "What time is it?": Intent("time"),
+    "What's the date today?": Intent("date"),
+    "Search YouTube for lofi in Robert's profile.": Intent("search", "lofi", site="youtube", profile="robert"),
+    "Google dress as a pirate.": Intent("search", "dress as a pirate", site="google"),
+    # Chrome profiles
+    "Open Chrome as Robert.": Intent("open_app", "chrome", profile="robert"),
+    "Open YouTube with my VIT profile.": Intent("open_website", "youtube", profile="vit"),
+    "Open Gmail in Robert's account.": Intent("open_website", "gmail", profile="robert"),
+    "Open Chrome as profile 4.": Intent("open_app", "chrome", profile="profile 4"),
+    "Search GitHub for jobs on my account.": Intent("search", "jobs on my account", site="github"),
+    "Search YouTube for sign in to my account.": Intent("search", "sign in to my account", site="youtube"),
 }
 
 # Must reach the LLM — either no pattern matches, or a loose match finds
 # nothing on disk.
 CONVERSATION = [
-    "What's the weather like today?",
     "Tell me a joke.",
     "How do I open a file in Python?",
     "Can you explain recursion?",
@@ -71,7 +152,6 @@ CONVERSATION = [
     "I went to the store yesterday.",
     "Should I go to bed?",
     "Back.",
-    "Start over.",
     "Start a timer for five minutes.",
     "Open up about your day.",
     "Go to sleep.",
@@ -83,9 +163,52 @@ CONVERSATION = [
     "Read me a story.",
     "What does a compiler do?",
     "Go to school.",
+    "Check the terminal.",
+    "Check on Chrome.",
+    "Google Chrome.",
+    "Search for the budget file.",
+    "Play a game with me.",
+    "Find my keys.",
+    "Search me.",
+    "Google is a company.",
+    "Google Drive.",
+    "Search my notes.",
+    "Search for my notes.",
+    "Search the project for TODO.",
+    "Open YouTube as fast as possible.",
+    "What's in the news today?",
+    "Find the video files.",
+    "Search for jazz music on my computer.",
+    "Do you remember the movie we talked about?",
+    "Remember me.",
+    "Forget it.",
+    "Forget about it.",
+    "Remember to buy milk.",
+    "What's new on YouTube?",
+    "Any issues on my mind?",
+    "I forgot my keys.",
     "",
     "   ",
 ]
+
+
+class QuitTest(unittest.TestCase):
+    def test_quit_phrases_alone(self) -> None:
+        for text in ("Stop.", "Goodbye!", "Okay, stop listening.", "Quit.", "Exit, please."):
+            with self.subTest(text=text):
+                self.assertTrue(wants_to_quit(text))
+
+    def test_quit_word_inside_a_request_is_not_a_quit(self) -> None:
+        for text in (
+            "Stop the music.",
+            "Don't stop.",
+            "Say goodbye to my friend.",
+            "How do I exit vim?",
+            "That's all.",  # answers "anything else?"
+            "Bye.",  # Whisper's favourite word for noise
+        ):
+            with self.subTest(text=text):
+                self.assertFalse(wants_to_quit(text))
 
 
 class RouteTest(unittest.TestCase):
@@ -147,9 +270,9 @@ class ExecuteTest(unittest.TestCase):
         self.assertTrue(self._handle("Open readme.").explain)
 
     def test_near_miss_never_moves(self) -> None:
-        # "window" is close to the folder "windows" but must not jump there.
+        # "windws" is close to the folder "windows" but must not jump there.
         with self.assertRaisesRegex(ToolError, "I can open Chrome"):
-            self._handle("Open the window.")
+            self._handle("Open windws.")
         self.assertEqual(self.ws.cwd, self.adi.resolve())
 
     def test_explicit_miss_is_spoken(self) -> None:

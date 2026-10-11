@@ -22,20 +22,30 @@ message that is safe to speak aloud.
 
 import difflib
 import fnmatch
+import json
 import os
 import re
 import stat
 import subprocess
 import time
+import urllib.parse
 import webbrowser
 from pathlib import Path
 from typing import Callable
 
+from .github import GitHub
+from .gmail import Gmail
+from .youtube import YouTube
+
 MAX_READ_BYTES = 4_000  # ~1.2k tokens: fits num_ctx 2048 with the prompt and a short history
 README_PREVIEW_BYTES = 2_000
 MAX_LIST_ENTRIES = 15  # names spoken per listing; the rest become a count
+BIG_FOLDER = 40  # past this many entries, say counts and the newest files instead
+NEWEST_SPOKEN = 5
 SUBFOLDER_SEARCH_SECONDS = 0.15  # when a file isn't here, how long to look one level down
 MATCH_CUTOFF = 0.75  # fuzzy-match floor for spoken names
+# How Whisper spells folder names it doesn't know (normalized) -> the name.
+SPOKEN_ALIASES = {"addy": "adi", "addie": "adi", "adie": "adi", "ady": "adi", "aadi": "adi"}
 EXACT_CUTOFF = 0.98  # name or stem equal after normalizing
 PREFIX_SCORE = 0.85  # "voice" -> voice_input
 AMBIGUITY_MARGIN = 0.05  # top two this close -> ask instead of guessing
@@ -46,6 +56,15 @@ SITES = {
     "youtube": ("YouTube", "https://www.youtube.com"),
     "github": ("GitHub", "https://github.com"),
 }
+
+# Search pages: the query is the user's own words, URL-encoded, never text
+# from a file or from the LLM. These are the only URLs besides SITES.
+SEARCHES = {
+    "youtube": ("YouTube", "https://www.youtube.com/results?search_query="),
+    "github": ("GitHub", "https://github.com/search?q="),
+    "google": ("Google", "https://www.google.com/search?q="),
+}
+MAX_QUERY_CHARS = 120
 
 # Spoken name -> canonical app. Keys are compared after _normalize().
 APP_ALIASES = {
@@ -227,6 +246,13 @@ def _is_hidden(name: str) -> bool:
     return name.startswith(".") or name.lower() in HIDDEN_NAMES or _is_sensitive(name)
 
 
+def _modified(path: Path) -> float:
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return 0.0
+
+
 def _first_file(*candidates: Path | None) -> str | None:
     return next((str(p) for p in candidates if p is not None and p.is_file()), None)
 
@@ -243,6 +269,71 @@ def _find_chrome() -> str | None:
         _env_path("PROGRAMFILES(X86)", *chrome),
         _env_path("LOCALAPPDATA", *chrome),
     )
+
+
+# Chrome profile folder to open, so the profile picker never appears.
+CHROME_PROFILE = "Default"
+
+
+def _chrome_profile_args(profile_dir: str = CHROME_PROFILE) -> list[str]:
+    return [f"--profile-directory={profile_dir}"]
+
+
+def chrome_profiles() -> dict[str, list[str]]:
+    """Chrome profile folder -> the names it answers to ('Robert', 'Aditya Sridhar').
+
+    Read from Chrome's own 'Local State' file: names only, nothing else is
+    used, and nothing is written. Empty if Chrome isn't set up.
+    """
+    path = _env_path("LOCALAPPDATA", "Google", "Chrome", "User Data", "Local State")
+    try:
+        cache = json.loads(path.read_text(encoding="utf-8"))["profile"]["info_cache"]
+        profiles = {}
+        for folder, info in cache.items():
+            # The folder name goes into Chrome's argv: only Chrome's own pattern.
+            if not _PROFILE_FOLDER.fullmatch(folder) or not isinstance(info, dict):
+                continue
+            names = [n for n in (info.get("name"), info.get("gaia_given_name"), info.get("gaia_name"))
+                     if isinstance(n, str) and n.strip()]
+            profiles[folder] = names
+        return profiles
+    except (AttributeError, OSError, ValueError, KeyError, TypeError):
+        return {}
+
+
+_PROFILE_FOLDER = re.compile(r"Default|Profile \d{1,3}")
+
+
+def resolve_chrome_profile(spoken: str, profiles: dict[str, list[str]]) -> str:
+    """Profile folder for a spoken name or folder ("robert", "profile 4").
+
+    Exact names beat prefixes ("vit" -> "vitstudent.ac.in"). When several
+    profiles share the name, the usual one wins only if the name is exactly
+    its name; otherwise the user is asked to say the folder. Raises ToolError.
+    """
+    key = _normalize(spoken)
+    if not key:
+        raise ToolError("Which Chrome profile?")
+    by_folder = [f for f in profiles if _normalize(f) == key]
+    if by_folder:
+        return by_folder[0]
+    for exact in (True, False):
+        found = [
+            folder
+            for folder, names in profiles.items()
+            if any(_normalize(n) == key if exact else len(key) >= 3 and _normalize(n).startswith(key) for n in names)
+        ]
+        if len(found) == 1:
+            return found[0]
+        if exact and CHROME_PROFILE in found:
+            return CHROME_PROFILE  # "Aditya" is the usual profile's own name
+        if found:
+            folders = " or ".join(sorted(found))
+            raise ToolError(f"More than one Chrome profile is called {spoken}. Say {folders}.")
+    names = sorted({names[0] for names in profiles.values() if names})
+    if not names:
+        raise ToolError("I can't find any Chrome profiles.")
+    raise ToolError(f"I don't see a Chrome profile called {spoken}. You have {', '.join(names)}.")
 
 
 def _find_vscode() -> str | None:
@@ -286,6 +377,10 @@ class Workspace:
         roots: dict[str, Path] | None = None,
         launcher: Launcher | None = None,
         open_url: Callable[[str], object] | None = None,
+        profiles: Callable[[], dict[str, list[str]]] | None = None,
+        fetch: Callable[[str], str] | None = None,
+        gmail: "Gmail | None" = None,
+        github: "GitHub | None" = None,
     ) -> None:
         resolved = {
             name: path.resolve()
@@ -297,7 +392,19 @@ class Workspace:
         self._roots = resolved
         self._launch = launcher or _launch
         self._open_url = open_url or webbrowser.open
+        self._profiles = profiles or chrome_profiles
+        self.youtube = YouTube(self._open_in_chrome, fetch)
+        # Read-only accounts; nothing is fetched until asked.
+        self.gmail = gmail or Gmail()
+        self.github = github or GitHub()
+        self.last_list = ""  # "youtube" or "email": what "the second one" refers to
         self.cwd = next(iter(resolved.values()))
+
+    def forget_lists(self) -> None:
+        """Moved on: "the second one" no longer means a video or an email."""
+        self.youtube.forget()
+        self.gmail.listed = []
+        self.last_list = ""
 
     @property
     def root_names(self) -> list[str]:
@@ -373,6 +480,7 @@ class Workspace:
         exact=True skips the fuzzy pass — for loosely phrased requests where a
         near-miss is more likely a misunderstanding than a typo.
         """
+        name = SPOKEN_ALIASES.get(_normalize(_clean_query(name)), name)
         if _normalize(_clean_query(name)) in _UP_WORDS:
             if self.cwd == self._root_of(self.cwd):
                 raise ToolError(f"We're already at the top of {self.where()}.")
@@ -408,6 +516,14 @@ class Workspace:
         folders, files = self._entries(self.cwd)
         if not folders and not files:
             return f"{self.where().capitalize()} is empty."
+        if len(folders) + len(files) > BIG_FOLDER:
+            # Reading out a few names from 1,400 isn't useful: say how many,
+            # and which files are newest (usually what you're looking for).
+            newest = sorted(files, key=_modified, reverse=True)[:NEWEST_SPOKEN]
+            said = f"{self.where().capitalize()} has {_count(folders, 'folder')} and {_count(files, 'file')}."
+            if newest:
+                said += f" The newest are: {', '.join(p.name for p in newest)}."
+            return said
         parts = []
         if folders:
             parts.append(f"{_count(folders, 'folder')}: {_join_capped(folders)}")
@@ -516,16 +632,46 @@ class Workspace:
 
     # ----- launching ---------------------------------------------------
 
-    def open_app(self, name: str) -> str:
-        """Open Chrome, a terminal, or VS Code."""
+    def open_app(self, name: str, profile: str = "") -> str:
+        """Open Chrome (in a named profile, if given), a terminal, or VS Code."""
         app = self._resolve_app(name)
+        if profile and app != "chrome":
+            raise ToolError("Only Chrome has profiles.")
         if app == "chrome":
-            self._launch([self._require(_find_chrome(), "Chrome")], None, False)
+            folder = self._chrome_profile(profile)
+            self._launch([self._require(_find_chrome(), "Chrome"), *_chrome_profile_args(folder)], None, False)
+            return f"Opening Chrome as {profile}." if profile else "Opening Chrome."
         elif app == "terminal":
             self._open_terminal(Path.home())
         else:
             self._launch([self._require(_find_vscode(), "VS Code")], None, False)
         return f"Opening {APP_LABELS[app]}."
+
+    def _chrome_profile(self, spoken: str) -> str:
+        return resolve_chrome_profile(spoken, self._profiles()) if spoken else CHROME_PROFILE
+
+    def search(self, site: str, query: str, profile: str = "") -> str:
+        """Open YouTube, GitHub, or Google search results for the user's words."""
+        key = _normalize(site)
+        if key not in SEARCHES:
+            raise ToolError("I can search YouTube, GitHub, or Google.")
+        query = " ".join(query.split())[:MAX_QUERY_CHARS].strip()
+        if not query:
+            raise ToolError(f"What should I search {SEARCHES[key][0]} for?")
+        label, base = SEARCHES[key]
+        self._open_in_chrome(base + urllib.parse.quote_plus(query), profile)
+        if key == "youtube":
+            self.youtube.remember_search(query, profile)  # "play the second one" picks from these
+        return f"Searching {label} for {query}."
+
+    def _open_in_chrome(self, url: str, profile: str) -> None:
+        chrome = _find_chrome()
+        if chrome:
+            self._launch([chrome, *_chrome_profile_args(self._chrome_profile(profile)), url], None, False)
+        elif profile:
+            raise ToolError("I can't find Chrome, so I can't pick a profile.")
+        else:
+            self._open_url(url)
 
     def open_here(self, name: str) -> str:
         """Open a terminal or VS Code in the current folder."""
@@ -538,18 +684,14 @@ class Workspace:
             raise ToolError("I can only open the terminal or VS Code in a folder.")
         return f"Opening {APP_LABELS[app]} in {self.where()}."
 
-    def open_website(self, site: str) -> str:
+    def open_website(self, site: str, profile: str = "") -> str:
         """Open Gmail, YouTube, or GitHub — nothing else."""
         key = resolve_site(site)
         if key is None:
             raise ToolError("I can only open Gmail, YouTube, or GitHub.")
         label, url = SITES[key]
-        chrome = _find_chrome()
-        if chrome:
-            self._launch([chrome, url], None, False)
-        else:
-            self._open_url(url)
-        return f"Opening {label}."
+        self._open_in_chrome(url, profile)
+        return f"Opening {label} as {profile}." if profile else f"Opening {label}."
 
     def _open_terminal(self, cwd: Path) -> None:
         command = _terminal_command(cwd)

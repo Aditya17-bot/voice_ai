@@ -24,15 +24,17 @@ import difflib
 import fnmatch
 import os
 import re
+import stat
 import subprocess
 import webbrowser
 from pathlib import Path
 from typing import Callable
 
-MAX_READ_BYTES = 8_000  # ~2k tokens: room for the file plus the conversation
+MAX_READ_BYTES = 4_000  # ~1.2k tokens: fits num_ctx 2048 with the prompt and a short history
 README_PREVIEW_BYTES = 2_000
-MAX_LIST_ENTRIES = 40
+MAX_LIST_ENTRIES = 15  # names spoken per listing; the rest become a count
 MATCH_CUTOFF = 0.75  # fuzzy-match floor for spoken names
+EXACT_CUTOFF = 0.98  # name or stem equal after normalizing
 PREFIX_SCORE = 0.85  # "voice" -> voice_input
 AMBIGUITY_MARGIN = 0.05  # top two this close -> ask instead of guessing
 
@@ -93,11 +95,19 @@ _UP_WORDS = {"up", "back", "parent", "goback", "upone", "oneup", "previous"}
 _FILLER_WORDS = re.compile(r"\b(?:the|my|folder|directory|file|called|named)\b")
 _SPOKEN_DOT = re.compile(r"\s+dot\s+")
 
+# Symlinks, junctions, and other reparse points can lead outside a folder.
+# Checked from scandir's cached data, so it costs nothing for plain entries.
+_REPARSE_POINT = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+
 Launcher = Callable[[list[str], Path | None, bool], None]
 
 
 class ToolError(Exception):
     """A failed action. str(error) is a friendly sentence safe to speak."""
+
+
+class NotFound(ToolError):
+    """No folder or file matched the spoken name."""
 
 
 def default_roots() -> dict[str, Path]:
@@ -161,6 +171,19 @@ def _best_match(query: str, entries: list[Path], cutoff: float = MATCH_CUTOFF) -
             )
         raise ToolError(f"Did you mean {first.name} or {second.name}?")
     return scored[0][1]
+
+
+def resolve_app(name: str) -> str | None:
+    """Canonical app ('chrome', 'terminal', 'vscode') for a spoken name, or None."""
+    key = _normalize(_clean_query(name))
+    return next((app for alias, app in APP_ALIASES.items() if _normalize(alias) == key), None)
+
+
+def resolve_site(name: str) -> str | None:
+    """SITES key for a spoken name ('G mail', 'youtube.com'), or None."""
+    key = _normalize(_clean_query(name))
+    key = key.removesuffix("com") if key.removesuffix("com") in SITES else key
+    return key if key in SITES else None
 
 
 def _is_sensitive(name: str) -> bool:
@@ -262,9 +285,10 @@ class Workspace:
         Links that lead outside the roots or to something private are left
         out entirely, so fuzzy matching never picks them.
         """
-        folder = self._guard(folder)  # re-check: a junction may have been swapped in
         try:
-            children = sorted(folder.iterdir(), key=lambda p: p.name.lower())
+            folder = self._guard(folder)  # re-check: a junction may have been swapped in
+            with os.scandir(folder) as it:
+                children = sorted(it, key=lambda e: e.name.lower())
         except OSError:
             return [], []
         folders: list[Path] = []
@@ -272,14 +296,23 @@ class Workspace:
         for child in children:
             if _is_hidden(child.name):
                 continue
+            path = Path(child.path)
             try:
-                target = self._guard(child)
+                # Only links can lead outside the guarded folder, so only
+                # they need the (slow) resolve — Downloads can hold thousands.
+                attributes = getattr(child.stat(follow_symlinks=False), "st_file_attributes", 0)
+                if child.is_symlink() or attributes & _REPARSE_POINT:
+                    target = self._guard(path)
+                    is_dir, is_file = target.is_dir(), target.is_file()
+                else:
+                    is_dir = child.is_dir(follow_symlinks=False)
+                    is_file = child.is_file(follow_symlinks=False)
             except (ToolError, OSError):
                 continue
-            if target.is_dir():
-                folders.append(child)
-            elif target.is_file():
-                files.append(child)
+            if is_dir:
+                folders.append(path)
+            elif is_file:
+                files.append(path)
         return folders, files
 
     def _root_of(self, path: Path) -> Path:
@@ -297,8 +330,12 @@ class Workspace:
             return f"the {self.cwd.name} folder"
         return f"{self.cwd.name}, inside {self.cwd.parent.name}"
 
-    def go_to_folder(self, name: str) -> str:
-        """Move into a folder by spoken name: a subfolder, a root, or 'up'."""
+    def go_to_folder(self, name: str, exact: bool = False) -> str:
+        """Move into a folder by spoken name: a subfolder, a root, or 'up'.
+
+        exact=True skips the fuzzy pass — for loosely phrased requests where a
+        near-miss is more likely a misunderstanding than a typo.
+        """
         if _normalize(_clean_query(name)) in _UP_WORDS:
             if self.cwd == self._root_of(self.cwd):
                 raise ToolError(f"We're already at the top of {self.where()}.")
@@ -309,16 +346,16 @@ class Workspace:
         # (so "go to voice input" works from anywhere) — then fuzzy, but only
         # here, so a near-miss never jumps somewhere unrelated.
         subfolders, _ = self._entries(self.cwd)
-        target = _best_match(name, subfolders, cutoff=0.98)
+        target = _best_match(name, subfolders, cutoff=EXACT_CUTOFF)
         if target is None:
             wider = list(self._roots.values())
             for root in self._roots.values():
                 wider.extend(self._entries(root)[0])
-            target = _best_match(name, wider, cutoff=0.98)
-        if target is None:
+            target = _best_match(name, wider, cutoff=EXACT_CUTOFF)
+        if target is None and not exact:
             target = _best_match(name, subfolders)
         if target is None:
-            raise ToolError(f"I couldn't find a folder called {name}.")
+            raise NotFound(f"I couldn't find a folder called {name}.")
         self.cwd = self._guard(target)
         return f"Now in {self.where()}."
 
@@ -329,10 +366,11 @@ class Workspace:
             return f"{self.where().capitalize()} is empty."
         parts = []
         if folders:
-            parts.append(f"{len(folders)} folders: {_join_capped(folders)}")
+            parts.append(f"{_count(folders, 'folder')}: {_join_capped(folders)}")
         if files:
-            parts.append(f"{len(files)} files: {_join_capped(files)}")
-        return f"{self.where().capitalize()} has " + "; and ".join(parts) + "."
+            parts.append(f"{_count(files, 'file')}: {_join_capped(files)}")
+        # Separate sentences so speech can start on the first one.
+        return f"{self.where().capitalize()} has " + ". It has ".join(parts) + "."
 
     def explain_folder(self) -> str:
         """Listing plus the start of the README, for the LLM to summarize."""
@@ -347,12 +385,12 @@ class Workspace:
             return summary
         return f"{summary}\n\nStart of {readme.name}:\n{text}"
 
-    def read_file(self, name: str) -> str:
+    def read_file(self, name: str, exact: bool = False) -> str:
         """Text of a file in the current folder (first MAX_READ_BYTES)."""
         _, files = self._entries(self.cwd)
-        target = _best_match(name, files)
+        target = _best_match(name, files, cutoff=EXACT_CUTOFF if exact else MATCH_CUTOFF)
         if target is None:
-            raise ToolError(f"I couldn't find a file called {name} here.")
+            raise NotFound(f"I couldn't find a file called {name} here.")
         text, truncated = self._read_text(self._guard(target), MAX_READ_BYTES)
         note = " (only the beginning — the file is longer)" if truncated else ""
         return f"Contents of {target.name}{note}:\n{text}"
@@ -399,9 +437,8 @@ class Workspace:
 
     def open_website(self, site: str) -> str:
         """Open Gmail, YouTube, or GitHub — nothing else."""
-        key = _normalize(_clean_query(site))
-        key = key.removesuffix("com") if key.removesuffix("com") in SITES else key
-        if key not in SITES:
+        key = resolve_site(site)
+        if key is None:
             raise ToolError("I can only open Gmail, YouTube, or GitHub.")
         label, url = SITES[key]
         chrome = _find_chrome()
@@ -419,10 +456,9 @@ class Workspace:
         self._launch(argv, cwd, new_console)
 
     def _resolve_app(self, name: str) -> str:
-        key = _normalize(_clean_query(name))
-        for alias, app in APP_ALIASES.items():
-            if _normalize(alias) == key:
-                return app
+        app = resolve_app(name)
+        if app is not None:
+            return app
         raise ToolError(f"I can't open {name}. I can open Chrome, the terminal, or VS Code.")
 
     @staticmethod
@@ -430,6 +466,10 @@ class Workspace:
         if executable is None:
             raise ToolError(f"I can't find {label} on this computer.")
         return executable
+
+
+def _count(items: list[Path], noun: str) -> str:
+    return f"{len(items)} {noun}" + ("" if len(items) == 1 else "s")
 
 
 def _join_capped(paths: list[Path]) -> str:

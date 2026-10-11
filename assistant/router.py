@@ -85,8 +85,12 @@ def _go(m: re.Match) -> Intent:
     return Intent("go_to_folder", name, loose=not explicit)
 
 
+# "open the github website", "open the chrome app" name the same thing.
+_KIND_SUFFIX = re.compile(r" (?:website|web site|site|page|app|application|program)$")
+
+
 def _open(m: re.Match) -> Intent | None:
-    target = _target(m["target"])
+    target = _KIND_SUFFIX.sub("", _target(m["target"]))
     if resolve_app(target):
         return Intent("open_app", target)
     if resolve_site(target):
@@ -145,6 +149,34 @@ _RULES: list[tuple[str, Callable[[re.Match], Intent | None]]] = [
     (rf"{_OPEN} (?P<target>.+)", _open),
 ]
 _COMPILED = [(re.compile(pattern), build) for pattern, build in _RULES]
+
+
+# Words that suggest a desktop request the rules above didn't catch ("pop open
+# a browser", "what's this repo for"). Only these utterances go to the LLM
+# classifier; chit-chat skips it, which is faster and can't misfire.
+_COMMAND_HINT = re.compile(
+    r"\b(?:open|launch|start|show|look|check|go|navigate|move|switch|jump"
+    r"|take|head|cd|folders?|director(?:y|ies)|files?|read|explain|describe"
+    r"|summari[sz]e|list|browser|chrome|terminal|console|powershell|vs code|vscode"
+    r"|editor|gmail|e?mails?|inbox|youtube|github|project|repo|here|inside|where"
+    r"|readme|downloads|desktop|pull up|bring up)\b"
+    r"|\w\.[a-z0-9]{1,5}\b|\bdot [a-z0-9]{1,5}\b"
+)
+
+
+# Advice and general-knowledge questions stay conversation even when they name
+# a command word: "how do I open a file in Python", "should I check my email".
+_QUESTION = re.compile(
+    r"^(?:how (?:do|can|would|should|does)|should|why|is it|is there|do you"
+    r"|where (?:is|are|do|does|can|should)"
+    r"|what(?:'s| is| are) (?:a|an|the best|your)|what does an? )\b"
+)
+
+
+def might_be_command(text: str) -> bool:
+    """True if an utterance the rules missed could still be a desktop request."""
+    prepared = _prepare(text)
+    return not _QUESTION.match(prepared) and bool(_COMMAND_HINT.search(prepared))
 
 
 def route(text: str) -> Intent | None:

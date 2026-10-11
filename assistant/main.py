@@ -1,5 +1,7 @@
 """Voice assistant: streaming replies with fallback and barge-in, plus
 read-only desktop actions (open apps and sites, browse and explain folders).
+Common commands take the regex fast path; other desktop-sounding requests let
+the LLM classify them; everything else is plain conversation.
 
 Speak over the bot and it stops and listens. Works best with headphones; on
 open speakers the bot may occasionally hear itself despite the stricter
@@ -9,6 +11,7 @@ barge-in threshold.
 quick testing without talking."""
 
 import argparse
+import contextlib
 import functools
 import re
 import sys
@@ -20,8 +23,9 @@ from .audio_io import Microphone, Player
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 from .brain import Brain
-from .fallback import FallbackEngine
-from .router import execute, route
+from .classifier import classify_request
+from .fallback import FallbackEngine, Watchdog
+from .router import Intent, execute, might_be_command, route
 from .stt import SpeechToText
 from .tools import APP_LABELS, SITES, ToolError, Workspace
 from .tts import TextToSpeech
@@ -60,27 +64,57 @@ class Assistant:
             self._synthesize_cached(phrase)
 
     def respond(self, text: str, started_at: float) -> None:
-        intent = route(text) if self._workspace else None
-        if intent is None:
+        if self._workspace is None:
             self._stream(text, started_at)
             return
-        print(f"   [fast path: {intent.action} {intent.arg!r}]")
+        intent = route(text)
+        if intent is not None:
+            print(f"   [fast path: {intent.action} {intent.arg!r}]")
+            if self._act(intent, text, started_at):
+                return
+            print("   [not a command after all — asking the LLM]")
+        if might_be_command(text):
+            self._classify(text, started_at)
+        else:
+            self._stream(text, started_at)
+
+    def _act(self, intent: Intent, text: str, started_at: float) -> bool:
+        """Run an intent and say the result. False: nothing matched, nothing said."""
         try:
             outcome = execute(intent, self._workspace)
         except ToolError as exc:
             self._speak(str(exc), started_at)
-            return
+            return True
         except Exception as exc:  # noqa: BLE001 — e.g. Popen failing; keep the session alive
             print(f"   (action failed: {type(exc).__name__}: {exc})")
             self._speak("Sorry, that didn't work. Want to try something else?", started_at)
-            return
+            return True
         if outcome is None:
-            print("   [not a command after all — asking the LLM]")
-            self._stream(text, started_at)
-        elif outcome.explain:
+            return False
+        if outcome.explain:
             self._stream(text, started_at, context=outcome.text)
         else:
             self._speak(outcome.text, started_at)
+        return True
+
+    def _classify(self, text: str, started_at: float) -> None:
+        """Ask the LLM what a request the router missed wants; act, or just reply.
+
+        One filler watchdog covers both LLM calls, so a dropped choice doesn't
+        restart the wait for a filler.
+        """
+        with self._fallback.watchdog() as watchdog:
+            try:
+                intent = classify_request(self._brain, self._workspace, text)
+            except Exception as exc:  # noqa: BLE001 — classifier trouble: just talk
+                print(f"   (classifier trouble: {type(exc).__name__}: {exc})")
+                intent = None
+            print(f"   [LLM picked: {intent or 'nothing, just talk'}]")
+            if intent is not None:
+                watchdog.cancel()
+                if self._act(intent, text, started_at):
+                    return
+            self._stream(text, started_at, watchdog=watchdog)
 
     def _speak(self, text: str, started_at: float) -> None:
         """Say fixed text (tool confirmation, listing, or refusal) sentence by sentence."""
@@ -95,11 +129,22 @@ class Assistant:
                 elapsed_ms = (time.perf_counter() - started_at) * 1000
         print(f"   [first word at {elapsed_ms:.0f} ms after you stopped]\n")
 
-    def _stream(self, text: str, started_at: float, context: str | None = None) -> None:
-        """Stream the LLM reply into the player, with filler and recovery."""
+    def _stream(
+        self,
+        text: str,
+        started_at: float,
+        context: str | None = None,
+        watchdog: Watchdog | None = None,
+    ) -> None:
+        """Stream the LLM reply into the player, with filler and recovery.
+
+        Pass a running `watchdog` to keep its filler timing instead of
+        starting a new one.
+        """
         first_word_ms = None
         try:
-            with self._fallback.watchdog() as watchdog:
+            dog = contextlib.nullcontext(watchdog) if watchdog else self._fallback.watchdog()
+            with dog as watchdog:
                 for sentence in self._brain.stream_reply(text, context=context):
                     audio, rate = self._tts.synthesize(sentence)
                     watchdog.cancel()

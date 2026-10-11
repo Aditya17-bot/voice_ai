@@ -31,6 +31,7 @@ ROUTED = {
     "Change directory to assistant.": Intent("go_to_folder", "assistant"),
     "cd tests": Intent("go_to_folder", "tests"),
     "Open the budget app folder.": Intent("go_to_folder", "budget app folder"),
+    "Open the GitHub website.": Intent("open_website", "github"),
     "Navigate to downloads.": Intent("go_to_folder", "downloads", loose=True),
     "Take me to the desktop.": Intent("go_to_folder", "desktop", loose=True),
     "Go back.": Intent("go_to_folder", "up"),

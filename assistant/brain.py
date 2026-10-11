@@ -18,6 +18,9 @@ GROUNDED_HISTORY_TURNS = 2
 # Small context keeps the whole model in VRAM on small GPUs and speeds up
 # prompt evaluation. Spoken turns are short; 2048 tokens is plenty.
 OLLAMA_OPTIONS = {"num_ctx": 2048}
+# A classification is a few deterministic tokens. Sampling options don't
+# reload the model; only num_ctx-like options would.
+CLASSIFY_OPTIONS = {**OLLAMA_OPTIONS, "temperature": 0, "num_predict": 40}
 
 # Sentence ends at . ! or ? followed by whitespace. Decimal points ("3.5")
 # never match because they lack the trailing whitespace. Trailing text (a
@@ -55,7 +58,9 @@ def _split_sentences(buffer: str) -> tuple[list[str], str]:
 SYSTEM_PROMPT = (
     "You are a friendly voice assistant. Your replies are spoken aloud, so: "
     "answer in 1-3 short conversational sentences, no markdown, no lists, "
-    "no emoji, spell out numbers and abbreviations naturally."
+    "no emoji, spell out numbers and abbreviations naturally. You can't see "
+    "files or folders on this computer unless their text is given to you, so "
+    "never guess what one contains; say you couldn't find it instead."
 )
 
 # Wraps tool output (file or folder contents) for a grounded turn. The text is
@@ -104,6 +109,35 @@ class Brain:
             raise RuntimeError(f"Ollama returned no content: {response.text[:200]}")
         self._remember_turn(user_text, text)
         return text
+
+    def classify(self, instructions: str, user_text: str, schema: dict, timeout: float = 10.0) -> dict:
+        """One JSON object shaped by `schema` (Ollama constrains the output).
+
+        Stateless on purpose: no history goes in and nothing is remembered, so
+        earlier replies (which may paraphrase file text) can't steer it.
+        Returns {} if the answer isn't a JSON object.
+        """
+        response = requests.post(
+            OLLAMA_URL,
+            json={
+                "model": self._model,
+                "messages": [
+                    {"role": "system", "content": instructions},
+                    {"role": "user", "content": user_text},
+                ],
+                "stream": False,
+                "format": schema,
+                "options": CLASSIFY_OPTIONS,
+            },
+            timeout=timeout,
+        )
+        response.raise_for_status()
+        content = (response.json().get("message") or {}).get("content") or ""
+        try:
+            answer = json.loads(content)
+        except json.JSONDecodeError:
+            return {}
+        return answer if isinstance(answer, dict) else {}
 
     def stream_reply(
         self, user_text: str, timeout: float = 60.0, context: str | None = None

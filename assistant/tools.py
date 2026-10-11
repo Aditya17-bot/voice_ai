@@ -267,6 +267,10 @@ class Workspace:
         self._open_url = open_url or webbrowser.open
         self.cwd = next(iter(resolved.values()))
 
+    @property
+    def root_names(self) -> list[str]:
+        return list(self._roots)
+
     # ----- path safety -------------------------------------------------
 
     def _guard(self, path: Path) -> Path:
@@ -371,6 +375,11 @@ class Workspace:
             parts.append(f"{_count(files, 'file')}: {_join_capped(files)}")
         # Separate sentences so speech can start on the first one.
         return f"{self.where().capitalize()} has " + ". It has ".join(parts) + "."
+
+    def names(self, limit: int = 30) -> tuple[list[str], list[str]]:
+        """Visible folder and file names here, for the LLM to pick from."""
+        folders, files = self._entries(self.cwd)
+        return [p.name for p in folders[:limit]], [p.name for p in files[:limit]]
 
     def explain_folder(self) -> str:
         """Listing plus the start of the README, for the LLM to summarize."""

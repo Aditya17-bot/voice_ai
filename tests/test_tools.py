@@ -191,6 +191,41 @@ class WorkspaceTest(unittest.TestCase):
             self.ws.open_app("notepad")
         self.assertEqual(self.launched, [])
 
+    def _fake_explorer(self) -> Path:
+        explorer = Path(self._tmp.name, "windows", "explorer.exe")
+        explorer.parent.mkdir(parents=True, exist_ok=True)
+        explorer.write_bytes(b"")
+        return explorer
+
+    def test_open_claude_desktop_app(self) -> None:
+        explorer = self._fake_explorer()
+        (Path(self._tmp.name, "localappdata", "Packages", tools.CLAUDE_PACKAGE)).mkdir(parents=True)
+        env = {"SYSTEMROOT": str(explorer.parent), "LOCALAPPDATA": str(Path(self._tmp.name, "localappdata"))}
+        with mock.patch.dict(os.environ, env):
+            self.assertEqual(self.ws.open_app("claude app"), "Opening Claude.")
+        self.assertEqual(self.launched[-1][0], [str(explorer), f"shell:AppsFolder\\{tools.CLAUDE_APP_ID}"])
+
+    def test_claude_not_installed(self) -> None:
+        explorer = self._fake_explorer()
+        env = {"SYSTEMROOT": str(explorer.parent), "LOCALAPPDATA": str(Path(self._tmp.name, "nothing"))}
+        with mock.patch.dict(os.environ, env), self.assertRaises(ToolError):
+            self.ws.open_app("claude")
+        self.assertEqual(self.launched, [])
+
+    def test_open_root_in_explorer(self) -> None:
+        explorer = self._fake_explorer()
+        with mock.patch.dict(os.environ, {"SYSTEMROOT": str(explorer.parent)}):
+            self.assertEqual(self.ws.open_in_explorer("downloads"), "Opening downloads.")
+        self.assertEqual(self.launched[-1][0], [str(explorer), str(self.downloads.resolve())])
+
+    def test_explorer_only_opens_roots(self) -> None:
+        explorer = self._fake_explorer()
+        with mock.patch.dict(os.environ, {"SYSTEMROOT": str(explorer.parent)}):
+            for name in ("outside", "desktop", "C:\\Windows", "voice_input", ".ssh"):
+                with self.assertRaises(ToolError):
+                    self.ws.open_in_explorer(name)
+        self.assertEqual(self.launched, [])
+
     def _fake_install(self, *parts: str) -> Path:
         exe = Path(self._tmp.name, "localappdata", *parts)
         exe.parent.mkdir(parents=True, exist_ok=True)

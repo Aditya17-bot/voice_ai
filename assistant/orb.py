@@ -6,6 +6,8 @@ another app in front:
 - click: bring the main window back
 - right-click: menu (show window, hands-free, quit)
 - Shift + drag: move it
+
+A small dot at its lower right means the camera is on (hand control).
 """
 
 import math
@@ -64,6 +66,9 @@ class Orb:
         self._core = c.create_oval(size / 2 - 4, size / 2 - 4, size / 2 + 4, size / 2 + 4, fill="#22d3ee", outline="")
         self._arc = c.create_arc(pad, pad, size - pad, size - pad, start=0, extent=0, style="arc",
                                  outline="#fbbf24", width=max(2, size * 0.05))
+        d = size * 0.16
+        self._camera = c.create_oval(size - d - 2, size - d - 2, size - 2, size - 2, fill="#22d3ee",
+                                     outline="#070b12", width=2, state="hidden")
         self._state, self._level, self._phase = "loading", 0.0, 0.0
         self._hold_job: str | None = None
         self._talking = False
@@ -79,6 +84,9 @@ class Orb:
 
     def set_state(self, state: str, level: float = 0.0) -> None:
         self._state, self._level = state, level
+
+    def set_camera(self, on: bool) -> None:
+        self.canvas.itemconfigure(self._camera, state="normal" if on else "hidden")
 
     # ----- mouse ---------------------------------------------------------
 

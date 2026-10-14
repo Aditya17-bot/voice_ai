@@ -1,10 +1,11 @@
-"""One-time account setup for read-only Gmail and GitHub.
+"""One-time setup: read-only Gmail and GitHub, and the hand-control model.
 
     python -m assistant.setup gmail path\\to\\client_secret.json
     python -m assistant.setup gmail          (sign in again, same client)
     python -m assistant.setup github
     python -m assistant.setup status
     python -m assistant.setup forget gmail|github
+    python -m assistant.setup hands          (download the hand model, ~8 MB)
 
 Gmail: signs in through Google in your browser and asks only for the
 read-only Gmail permission; a login with any wider permission is refused.
@@ -28,7 +29,7 @@ from pathlib import Path
 
 import requests
 
-from . import credentials, github, gmail
+from . import credentials, github, gmail, hands
 
 # Windows consoles default to cp1252, which can't print ✓ / ✗.
 if hasattr(sys.stdout, "reconfigure"):
@@ -158,6 +159,28 @@ def setup_github() -> None:
     print(f"✓ GitHub connected for {response.json().get('login')}.")
 
 
+def setup_hands() -> None:
+    """Download MediaPipe's hand model next to the other models."""
+    if hands.MODEL_PATH.is_file():
+        print(f"✓ Hand model already at {hands.MODEL_PATH}.")
+        return
+    print("Downloading the hand model…")
+    try:
+        response = requests.get(hands.MODEL_URL, timeout=60)
+        response.raise_for_status()
+    except requests.RequestException as exc:
+        _fail(f"Download failed: {exc}")
+    hands.MODEL_PATH.parent.mkdir(parents=True, exist_ok=True)
+    partial = hands.MODEL_PATH.with_suffix(".part")
+    partial.write_bytes(response.content)
+    partial.replace(hands.MODEL_PATH)  # never leave a half-written model behind
+    print(f"✓ Saved {len(response.content) // 1024} KB to {hands.MODEL_PATH}.")
+    try:
+        hands.check()
+    except hands.HandsUnavailable as exc:
+        print(f"Next: {exc}")
+
+
 def status() -> None:
     for name in (gmail.SECRET_NAME, github.SECRET_NAME):
         print(f"{name}: {'saved' if credentials.load(name) else 'not set up'}")
@@ -169,6 +192,8 @@ def main(argv: list[str]) -> None:
         setup_gmail(argv[1] if len(argv) >= 2 else None)
     elif argv[:1] == ["github"]:
         setup_github()
+    elif argv[:1] == ["hands"]:
+        setup_hands()
     elif argv[:1] == ["status"]:
         status()
     elif len(argv) == 2 and argv[0] == "forget" and argv[1] in (gmail.SECRET_NAME, github.SECRET_NAME):

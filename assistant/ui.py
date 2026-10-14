@@ -9,6 +9,8 @@ Threads:
   audio is kept only while Space or the mic button is held, so background
   talk and the assistant's own voice are never transcribed. Hands-free mode
   listens with voice detection whenever the assistant is quiet.
+- The camera thread (only while "Hands" is on) tracks one hand and posts
+  gesture events; see handmenu.py.
 """
 
 import queue
@@ -22,6 +24,7 @@ import numpy as np
 
 from .audio_io import CHUNK_SAMPLES, SAMPLE_RATE, Microphone
 from .face import FACES
+from .handmenu import HandControl, Overlay
 from .hotkey import TalkKey
 from .orb import Orb
 from .router import wants_to_quit
@@ -274,6 +277,7 @@ class Window:
         self._events: queue.Queue = queue.Queue()
         self.session: Session | None = None
         self.talk_key: TalkKey | None = None
+        self.hand_control: HandControl | None = None
         self._button_lit = False
         self._last_kind = ""  # kind of the last chat line, to join a reply's sentences
         self._build()
@@ -296,7 +300,7 @@ class Window:
         self.orb = Orb(
             root, lambda: self._talk_down("orb"), lambda: self._talk_up("orb"), self._show_window,
             menu=[("Show window", self._show_window), ("Hands-free on / off", self._flip_hands_free),
-                  ("Quit", self._quit)],
+                  ("Camera (hand control) on / off", self._flip_camera), ("Quit", self._quit)],
         )
 
         log_frame = tk.Frame(panel, bg=PANEL)
@@ -340,6 +344,12 @@ class Window:
             bg=PANEL, fg=TEXT, selectcolor=FIELD, activebackground=PANEL, activeforeground=TEXT,
             font=("Segoe UI", 10), takefocus=0,
         ).pack(side="left", padx=(10, 0))
+        self.hands_on = tk.BooleanVar(value=False)
+        tk.Checkbutton(
+            row, text="✋ Hands", variable=self.hands_on, command=self._toggle_camera,
+            bg=PANEL, fg=TEXT, selectcolor=FIELD, activebackground=PANEL, activeforeground=TEXT,
+            font=("Segoe UI", 10), takefocus=0,
+        ).pack(side="left", padx=(6, 0))
 
         self.status = tk.Label(
             panel, bg=PANEL, fg=MUTED, font=("Segoe UI", 9), anchor="w",
@@ -432,6 +442,24 @@ class Window:
         self.hands_free.set(not self.hands_free.get())
         self._toggle_hands_free()
 
+    def _toggle_camera(self) -> str | None:
+        """Follow the checkbox; returns why the camera couldn't start, if it couldn't."""
+        if self.hand_control is None:
+            self.hands_on.set(False)
+            return "Hand control isn't ready yet."
+        if self.hands_on.get():
+            return self.hand_control.start()
+        self.hand_control.stop()
+        return None
+
+    def _flip_camera(self) -> None:
+        self.hands_on.set(not self.hands_on.get())
+        self._toggle_camera()
+
+    def _camera_state(self, on: bool) -> None:
+        self.hands_on.set(on)
+        self.orb.set_camera(on)
+
     def _show_window(self) -> None:
         self.root.deiconify()
         self.root.lift()
@@ -460,9 +488,30 @@ class Window:
             self.hands_free.set(on)
             self._toggle_hands_free()
 
+        def camera(on: bool) -> Callable[[], str]:
+            def run() -> str:
+                # Wait for the main loop to try, so the reply says what happened.
+                done, outcome = threading.Event(), {}
+
+                def act() -> None:
+                    self.hands_on.set(on)
+                    outcome["error"] = self._toggle_camera()
+                    done.set()
+
+                self._events.put(("call", act))
+                if not on:
+                    return "Camera off."
+                if not done.wait(3) or outcome.get("error"):
+                    return "I couldn't turn the camera on. The chat says why."
+                return "Camera on. Hold up your palm for the menu."
+
+            return run
+
         return {
             "hands_free_on": post(lambda: set_hands_free(True), "Hands-free is on. Just talk."),
             "hands_free_off": post(lambda: set_hands_free(False), "Back to push to talk."),
+            "camera_on": camera(True),
+            "camera_off": camera(False),
             "fullscreen_on": post(lambda: self._fullscreen(True), "Full screen."),
             "fullscreen_off": post(lambda: self._fullscreen(False), "Okay."),
             "next_face": post(self._next_face, "New look."),
@@ -496,6 +545,13 @@ class Window:
             _, assistant, stt, detector = event
             self.session = Session(assistant, stt, detector, self._events, self._log)
             assistant.ui_actions = self._ui_actions()
+            self.hand_control = HandControl(
+                post=lambda fn: self._events.put(("call", fn)),
+                log=self._log,
+                workspace=lambda: assistant.workspace,
+                on_state=self._camera_state,
+                overlay=lambda: Overlay(self.root),
+            )
             if stt is None:
                 self.mic_button.configure(state="disabled", text="🎤 (no mic)")
             else:
@@ -567,6 +623,8 @@ class Window:
         self.log.see("end")
 
     def _quit(self) -> None:
+        if self.hand_control is not None:
+            self.hand_control.stop()
         if self.session is not None:
             self.session.close()
         self.root.destroy()
@@ -580,6 +638,8 @@ class Window:
         finally:
             if self.talk_key is not None:
                 self.talk_key.stop()
+            if self.hand_control is not None:
+                self.hand_control.stop()
             if self.session is not None:
                 self.session.close()
                 self.session.assistant.player.close()

@@ -67,6 +67,15 @@ ROUTED = {
     "Change your face.": Intent("ui", "next_face"),
     "Hide.": Intent("ui", "hide"),
     "Come back.": Intent("ui", "show"),
+    "Camera on.": Intent("ui", "camera_on"),
+    "Turn on the camera.": Intent("ui", "camera_on"),
+    "Start hand control.": Intent("ui", "camera_on"),
+    "Gestures on.": Intent("ui", "camera_on"),
+    "Turn off the camera.": Intent("ui", "camera_off"),
+    "Hand control off.": Intent("ui", "camera_off"),
+    "Stop gestures.": Intent("ui", "camera_off"),
+    "Open Claude.": Intent("open_app", "claude"),
+    "Open the Claude app.": Intent("open_app", "claude"),
     # "check X"
     "Check the patents folder.": Intent("go_to_folder", "patents folder", loose=True),
     "Check my email.": Intent("open_website", "gmail"),
@@ -144,6 +153,9 @@ ROUTED = {
 # Must reach the LLM — either no pattern matches, or a loose match finds
 # nothing on disk.
 CONVERSATION = [
+    "Which camera should I buy?",
+    "Is my camera any good for video calls?",
+    "Who made Claude?",
     "Tell me a joke.",
     "How do I open a file in Python?",
     "Can you explain recursion?",

@@ -9,7 +9,9 @@ Safety model:
 - Only three sites can be opened. File contents reach the LLM, so a free-form
   URL tool would let a malicious file make the model send data out.
 - Programs are launched by absolute path with argument lists, never through a
-  shell string or a PATH/current-directory lookup.
+  shell string or a PATH/current-directory lookup. File Explorer is used
+  only to show one of the allowed root folders (from the hand menu) and to
+  start the Claude desktop app, never as a general "open anything".
 
 Known limitation: checks are by name, so a hard link to a secret under an
 innocent name in an allowed folder would be readable. Creating one needs local
@@ -79,8 +81,16 @@ APP_ALIASES = {
     "code": "vscode",
     "visual studio code": "vscode",
     "editor": "vscode",
+    "claude": "claude",
+    "claude app": "claude",
+    "claude desktop": "claude",
 }
-APP_LABELS = {"chrome": "Chrome", "terminal": "the terminal", "vscode": "VS Code"}
+APP_LABELS = {"chrome": "Chrome", "terminal": "the terminal", "vscode": "VS Code", "claude": "Claude"}
+
+# The Claude desktop app is a Store app: started by its app ID through
+# Explorer's AppsFolder, the same thing the Start menu does.
+CLAUDE_PACKAGE = "Claude_pzs8sxrjxfjjc"
+CLAUDE_APP_ID = CLAUDE_PACKAGE + "!Claude"
 
 # Clutter hidden from listings and fuzzy matching (dotfiles are hidden too).
 HIDDEN_NAMES = {"node_modules", "__pycache__", "venv", "desktop.ini", "thumbs.db"}
@@ -341,6 +351,15 @@ def _find_vscode() -> str | None:
         _env_path("LOCALAPPDATA", "Programs", "Microsoft VS Code", "Code.exe"),
         _env_path("PROGRAMFILES", "Microsoft VS Code", "Code.exe"),
     )
+
+
+def _find_explorer() -> str | None:
+    return _first_file(_env_path("SYSTEMROOT", "explorer.exe"))
+
+
+def _claude_installed() -> bool:
+    folder = _env_path("LOCALAPPDATA", "Packages", CLAUDE_PACKAGE)
+    return folder is not None and folder.is_dir()
 
 
 def _terminal_command(cwd: Path) -> tuple[list[str], bool] | None:
@@ -643,6 +662,11 @@ class Workspace:
             return f"Opening Chrome as {profile}." if profile else "Opening Chrome."
         elif app == "terminal":
             self._open_terminal(Path.home())
+        elif app == "claude":
+            if not _claude_installed():
+                raise ToolError("I can't find the Claude app on this computer.")
+            explorer = self._require(_find_explorer(), "File Explorer")
+            self._launch([explorer, f"shell:AppsFolder\\{CLAUDE_APP_ID}"], None, False)
         else:
             self._launch([self._require(_find_vscode(), "VS Code")], None, False)
         return f"Opening {APP_LABELS[app]}."
@@ -693,6 +717,15 @@ class Workspace:
         self._open_in_chrome(url, profile)
         return f"Opening {label} as {profile}." if profile else f"Opening {label}."
 
+    def open_in_explorer(self, root: str) -> str:
+        """Show one of the allowed root folders (adi, desktop, downloads) in File Explorer."""
+        folder = self._roots.get(root)
+        if folder is None:
+            raise ToolError(f"I can only show {', '.join(self._roots)} in Explorer.")
+        explorer = self._require(_find_explorer(), "File Explorer")
+        self._launch([explorer, str(self._guard(folder))], None, False)
+        return f"Opening {root}."
+
     def _open_terminal(self, cwd: Path) -> None:
         command = _terminal_command(cwd)
         if command is None:
@@ -704,7 +737,7 @@ class Workspace:
         app = resolve_app(name)
         if app is not None:
             return app
-        raise ToolError(f"I can't open {name}. I can open Chrome, the terminal, or VS Code.")
+        raise ToolError(f"I can't open {name}. I can open Chrome, the terminal, VS Code, or Claude.")
 
     @staticmethod
     def _require(executable: str | None, label: str) -> str:

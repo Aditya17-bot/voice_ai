@@ -138,6 +138,11 @@ class Assistant:
             watchdog.cancel()  # no fillers either
         self.player.stop()
 
+    @property
+    def workspace(self) -> Workspace | None:
+        """The read-only tools, shared with the hand menu."""
+        return self._workspace
+
     def respond(self, text: str, started_at: float) -> None:
         self._cancel.clear()
         self._turn += 1

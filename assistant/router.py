@@ -206,6 +206,8 @@ _ORD = "|".join(_ORDINALS_SPOKEN)
 _CARD = "|".join(_CARDINALS)
 _PICK_VERB = r"(?:click|play|open|watch|start|put on|select|choose|pick|show me|read)(?: me)?(?: on)?"
 _PICK_NOUN = r"(?: one| video| result| link| song| track| e ?mail| message)"
+# Hand gesture control, by any of its names.
+_CAMERA = r"(?:camera|webcam|hand control|hand gestures?|gestures?|hand tracking)"
 # Things you watch or listen to: "find an anime video", "play some lofi music".
 _MEDIA = r"(?:videos?|songs?|music|trailers?|podcasts?|playlists?|mix|movie trailers?)"
 
@@ -282,12 +284,14 @@ def _look_in(m: re.Match) -> Intent | None:
 
 HELP_TEXT = (
     "I can talk with you about anything, and on this computer I can: "
-    "open Chrome, the terminal or VS Code. Open Gmail, YouTube or GitHub. "
+    "open Chrome, the terminal, VS Code or Claude. Open Gmail, YouTube or GitHub. "
     "Search YouTube, GitHub or Google, and play a YouTube video, then play the second one or the next one. "
     "Move between your folders in adi, Desktop and Downloads, list them, and explain a file or folder. "
     "Once you connect them, read your Gmail, like how many emails today, or emails from someone, "
     "and your GitHub repos, issues and commits. "
     "Remember things you tell me, and tell you the time and date. I only read, I never change your files. "
+    "Say camera on to control windows with your hand: thumbs up for a menu, hold your palm still then move it "
+    "to switch windows, two fingers for desktops, one finger for tabs, thumbs down to close a window. "
     "Hold Right Control to talk, and say stop to quit."
 )
 
@@ -467,6 +471,14 @@ _RULES: list[tuple[str, Callable[[re.Match], Intent | None]]] = [
         r"(?:go |switch |switch to |back to |use )?(?:back to )?push[ -]to[ -]talk(?: mode)?"
         r"|(?:turn )?(?:off hands[ -]?free|hands[ -]?free off)",
         lambda m: Intent("ui", "hands_free_off"),
+    ),
+    (
+        rf"(?:turn on|switch on|start|enable|use) (?:the |my )?{_CAMERA}|(?:the )?{_CAMERA} on",
+        lambda m: Intent("ui", "camera_on"),
+    ),
+    (
+        rf"(?:turn off|switch off|stop|disable|close) (?:the |my )?{_CAMERA}|(?:the )?{_CAMERA} off",
+        lambda m: Intent("ui", "camera_off"),
     ),
     (r"(?:go |make it |switch to |enter )?full ?screen(?: mode)?", lambda m: Intent("ui", "fullscreen_on")),
     (r"(?:exit|leave|close|turn off) full ?screen(?: mode)?", lambda m: Intent("ui", "fullscreen_off")),
@@ -692,7 +704,7 @@ def _run(intent: Intent, workspace: Workspace) -> Outcome:
         except NotFound:
             raise NotFound(
                 f"I can't open {intent.arg}. I can open Chrome, the terminal, "
-                "VS Code, Gmail, YouTube, GitHub, or one of your folders."
+                "VS Code, Claude, Gmail, YouTube, GitHub, or one of your folders."
             ) from None
     raise ValueError(f"unknown action {intent.action!r}")
 

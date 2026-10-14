@@ -223,6 +223,10 @@ tuning set, 18/20 on a held-out set, 0 wrong actions on either.
 15. **Memory, Gmail, GitHub** — "remember that…" (the one write, to
     `data/memory.json`); read-only Gmail and GitHub with server-enforced
     read-only logins.
+16. **Hand gestures** — webcam hand control: a thumbs-up menu of apps,
+    sites and folders, dials (hold a shape, then move) to switch windows,
+    desktops and tabs, thumbs down to close the front window. The Claude desktop app
+    joins the app list. Design: `docs/superpowers/specs/2026-10-14-hand-gestures-design.md`.
 
 ### YouTube playing (`youtube.py`)
 The assistant can't click inside Chrome, so it reads YouTube's results page
@@ -250,6 +254,88 @@ Local time and date, and "what time is it in Tokyo", are worked out from the
 can't be known offline, so "what's the weather in Paris" opens Google's
 answer for those words.
 
+### Hand gestures (`hands.py`, `gestures.py`, `handmenu.py`, `windows.py`)
+Off until "✋ Hands" is ticked or you say "camera on". A camera thread grabs
+mirrored frames (15 fps, 5 fps after 3 s with no hand) and MediaPipe's
+gesture recognizer turns each into 21 points plus a label (Open_Palm,
+Victory, Thumb_Down, …) from a model trained on real hands; frames are never
+saved or sent. `gestures.py` is a pure state machine from points and labels
+to events (point rules are the fallback when the label has no opinion), so
+it is unit-tested without a camera:
+
+| Gesture | Does |
+|---|---|
+| 👍 thumbs up held 0.6 s | hand menu: a 2×5 grid; then the open palm moves the highlight like a pointer; ✊ grab or a quick pinch (tap) opens it; hand away closes |
+| ✋ open hand held still 0.5 s, then moved | window dial: every 0.07 frame widths right / left is the next / previous window (like Alt+Tab) |
+| ✌ two fingers held still 0.5 s, then moved | desktop dial: right / left virtual desktop |
+| ☝ one finger held still 0.5 s, then moved | tab dial: next / previous tab in the front window |
+| 👎 thumbs down held 1 s | close the front window (a red ring fills; lower the hand to cancel) |
+
+A dial is a scroll wheel: steps follow where the hand is from where the
+dial opened, at most one per frame, only once the hand is a quarter step
+past the line (no jitter steps), so moving back steps back. Any other shape
+holds it; ✊, hand away 0.6 s or 6 s without a step ends it. Every action
+and every dial's end is followed by 1 s of cooldown. In the menu the
+highlight starts on the middle of the top row once the palm has been open
+3 frames (the thumbs up lowering through a fist is not a grab); the palm
+moves it one tile per 0.07 frame widths (0.10 heights), and only once it is
+a quarter tile past the border, so jitter never flickers. No open palm
+within 3 s of the thumb coming down closes the menu. Any shape but an open palm freezes the
+highlight, so closing the hand doesn't move it. A grab is a fist for 3
+frames; a tap (from barehands) is a pinch of 2+ frames let go within 0.6 s;
+either opens the tile only if the highlight had stayed on it 0.25 s when the
+hand began to close. The first
+version (a ring of tiles picked by the palm's angle, 👌 to open) was too
+fiddly in the live test. Menu tiles go through the same `Workspace` methods as
+voice: YouTube, Gmail, GitHub, Chrome, Terminal, VS Code, Claude, and the
+allowed root folders, which open in File Explorer (only those roots).
+
+Window control (`windows.py`, ctypes) is kept narrow: close posts
+`WM_CLOSE`, the same as the window's X, so the app still asks to save. It
+closes only the window the overlay named when the thumb went down (if
+another came to the front, nothing closes), and refuses the desktop, the
+taskbar, our own windows and the terminal or editor we were started from. Switching brings an
+Alt-Tab window (this desktop only) to the front; "next" also sends the old
+one to the back, so repeated steps cycle, and a step back undoes one. The only keystrokes ever sent
+are Win+Ctrl+Left/Right and Ctrl+Tab / Ctrl+Shift+Tab (never to the
+desktop or taskbar), with the left Ctrl so the talk key never sees them.
+Window titles appear in the overlay and the chat only.
+
+The overlay is a click-through, never-focused, see-through window in the
+middle of the screen; it stays shown and simply draws nothing when idle,
+because showing a window takes the focus. Optional install:
+`pip install -r requirements-hands.txt` and `python -m assistant.setup hands`
+(~8 MB model). Measured: 16–23 ms per frame on the CPU; the camera takes
+~1.6 s to open. `python -m assistant.hands [seconds]` is a dry run for
+tuning the thresholds in `gestures.py`: it prints the label, hand shape,
+thumb–index gap and every gesture event, and acts on nothing. Desktop
+switching was checked live (temporary second desktop, both directions).
+
+First live try (2026-10-14) barely worked. A recording of the hand points
+showed why: the hand sat at the bottom edge of the camera frame (palm
+centre y ≈ 0.95), so MediaPipe saw part of it and kept losing it, and the
+user had no way to know. Since then, while the camera is on, a small hand
+view in the bottom-right corner draws the frame as a box, the hand's
+skeleton in it (points only, never the picture) and the shape it reads,
+or "raise your hand ↑" / "move your hand to the middle" near the edges.
+The same recording showed a held thumbs down closing two windows: a frame
+whose label dipped under the score cut read as a fist and counted as
+"thumb lowered". The thumb must now be gone 0.6 s (`CLOSE_REARM_S`).
+
+Windows and desktops were swipes until the second and third live tests. In
+a dim room the camera's long exposure blurred a fast hand out of sight for
+the whole stroke (allowed for by counting a hand that vanished and came back
+across the frame). In good light the hand stayed in sight, but recordings
+showed swipe, swing straight back, rest, swipe again, with the pause at the
+far end of a swing back (0.15–0.45 s) no shorter than the rest before a
+real swipe (0.4–0.55 s): every rule tried either switched windows on the
+swing back or missed real swipes, and one wrong switch made the next real
+swipe look like a swing back. The same recording ran the tab dial 13 steps
+with none wrong, so windows and desktops became dials too. The menu moved
+from a still palm to a thumbs up, because a palm resting between swipes
+opened it; a thumbs up read on a hand cut off by the bottom of the frame
+(palm centre below 0.88) doesn't count.
+
 ### Right Ctrl talk key (`hotkey.py`)
 No keyboard hook: a thread polls `GetAsyncKeyState` for Right Ctrl every
 20 ms and starts recording after 200 ms held. While it's held, any other key
@@ -267,3 +353,6 @@ came out as "www.cf.com". Push-to-talk solved more of the mishearing.
   results, their own Gmail and GitHub).
 - No wake word (push-to-talk is enough).
 - No typing into other apps: keystrokes could land in a terminal and run.
+  (The fixed exceptions: the desktop switch and Ctrl+Tab / Ctrl+Shift+Tab.
+  Neither contains Enter or text, so in a terminal nothing can run.)
+- No mouse control by hand: a wrong click is worse than a miss.

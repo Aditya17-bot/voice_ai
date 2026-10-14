@@ -17,6 +17,7 @@ import queue
 import threading
 import time
 import tkinter as tk
+import tkinter.ttk as ttk
 from collections import deque
 from typing import Callable
 
@@ -28,6 +29,26 @@ from .handmenu import HandControl, Overlay
 from .hotkey import TalkKey
 from .orb import Orb
 from .router import wants_to_quit
+from .widgets import (
+    ACCENT,
+    ACCENT_FILL,
+    ACCENT_HOVER,
+    BG,
+    BORDER,
+    BOT_BUBBLE,
+    DANGER,
+    GO,
+    MUTED,
+    PANEL,
+    TEXT,
+    WARN,
+    YOU_BUBBLE,
+    Bubble,
+    Chip,
+    Pill,
+    RoundedEntry,
+    Toggle,
+)
 
 Log = Callable[[str, str], None]  # (kind, text); kind is "you", "bot" or "note"
 
@@ -41,14 +62,15 @@ PRE_ROLL_MS = 320  # and keep this much from before the press: the first one sta
 ECHO_TAIL_S = 0.35  # hands-free: wait this long after we stop talking before listening
 POLL_MS = 30
 
-BG = "#070b12"
-PANEL = "#0b1220"
-FIELD = "#0f172a"
-TEXT = "#e2e8f0"
-MUTED = "#64748b"
-YOU = "#93c5fd"
-ACCENT = "#22d3ee"
-DANGER = "#f87171"
+BUBBLE_SHARE = 0.72  # a chat bubble is at most this share of the chat's width
+STATES = {  # face state -> header chip
+    "loading": ("Starting up", MUTED),
+    "idle": ("Ready", ACCENT),
+    "listening": ("Listening", GO),
+    "thinking": ("Thinking", WARN),
+    "speaking": ("Speaking", ACCENT),
+}
+RECORDING = "#166534"
 
 
 class Session:
@@ -280,6 +302,8 @@ class Window:
         self.hand_control: HandControl | None = None
         self._button_lit = False
         self._last_kind = ""  # kind of the last chat line, to join a reply's sentences
+        self._bubbles: list[Bubble] = []
+        self._mic_ok = True
         self._build()
         self.root.protocol("WM_DELETE_WINDOW", self._quit)
         threading.Thread(target=self._load, args=(load,), daemon=True, name="loader").start()
@@ -288,9 +312,29 @@ class Window:
 
     def _build(self) -> None:
         root = self.root
-        # The panel is packed first so that a small window shrinks the face,
-        # never the chat box and buttons.
-        panel = tk.Frame(root, bg=PANEL)
+        scale = root.winfo_fpixels("1i") / 96
+        style = ttk.Style(root)
+        style.theme_use("clam")  # the only built-in theme whose scrollbar takes colours
+        style.configure("Chat.Vertical.TScrollbar", background=BORDER, troughcolor=PANEL, bordercolor=PANEL,
+                        lightcolor=BORDER, darkcolor=BORDER, arrowcolor=MUTED, gripcount=0,
+                        arrowsize=int(12 * scale))
+        style.map("Chat.Vertical.TScrollbar", background=[("active", "#334155")])
+
+        header = tk.Frame(root, bg=BG)
+        header.pack(fill="x", side="top", padx=16, pady=(10, 0))
+        tk.Label(header, text=NAME, bg=BG, fg=TEXT, font=("Segoe UI Semibold", 13)).pack(side="left")
+        tk.Label(header, text="offline assistant", bg=BG, fg=MUTED, font=("Segoe UI", 9)).pack(
+            side="left", padx=(8, 0), pady=(3, 0))
+        self.camera_chip, self.mic_chip, self.state_chip = Chip(header), Chip(header), Chip(header)
+        for chip in (self.camera_chip, self.mic_chip, self.state_chip):
+            chip.pack(side="right", padx=(6, 0))
+        self.camera_chip.set("Camera off", MUTED)
+        self.mic_chip.set("Mic", MUTED)
+        self.state_chip.set(*STATES["loading"])
+
+        # The panel is packed before the face so that a small window shrinks
+        # the face, never the chat box and buttons.
+        panel = tk.Frame(root, bg=PANEL, highlightthickness=1, highlightbackground=BORDER)
         panel.pack(fill="x", side="bottom")
         self._faces = [make(root, NAME) for make in FACES.values()]
         for face in self._faces:
@@ -304,58 +348,54 @@ class Window:
         )
 
         log_frame = tk.Frame(panel, bg=PANEL)
-        log_frame.pack(fill="x", padx=14, pady=(12, 6))
+        log_frame.pack(fill="x", padx=14, pady=(12, 8))
         self.log = tk.Text(
-            log_frame, height=7, bg=PANEL, fg=TEXT, relief="flat", wrap="word",
-            font=("Segoe UI", 11), padx=6, pady=4, highlightthickness=0, cursor="arrow",
+            log_frame, height=11, bg=PANEL, fg=TEXT, relief="flat", wrap="word",
+            font=("Segoe UI", 11), padx=4, pady=2, highlightthickness=0, cursor="arrow",
         )
-        scroll = tk.Scrollbar(log_frame, command=self.log.yview)
+        scroll = ttk.Scrollbar(log_frame, command=self.log.yview, style="Chat.Vertical.TScrollbar")
         self.log.configure(yscrollcommand=scroll.set, state="disabled")
         scroll.pack(side="right", fill="y")
         self.log.pack(side="left", fill="x", expand=True)
-        self.log.tag_configure("you", foreground=YOU, font=("Segoe UI", 11, "bold"))
-        self.log.tag_configure("bot", foreground=TEXT)
-        self.log.tag_configure("note", foreground=MUTED, font=("Segoe UI", 9))
-        self.log.tag_configure("who_bot", foreground=ACCENT, font=("Segoe UI", 11, "bold"))
+        gap = int(4 * scale)
+        self.log.tag_configure("bot", justify="left", spacing1=gap, spacing3=gap)
+        self.log.tag_configure("you", justify="right", spacing1=gap, spacing3=gap)
+        self.log.tag_configure("note", justify="center", foreground=MUTED, font=("Segoe UI", 9),
+                               spacing1=gap, spacing3=gap)
+        self.log.bind("<Configure>", lambda e: self._fit_bubbles())
+        self.log.bind("<MouseWheel>", self._wheel)
 
         row = tk.Frame(panel, bg=PANEL)
-        row.pack(fill="x", padx=14, pady=(0, 6), side="bottom", before=log_frame)
-        self.entry = tk.Entry(
-            row, bg=FIELD, fg=TEXT, insertbackground=TEXT, relief="flat",
-            font=("Segoe UI", 12), highlightthickness=1, highlightcolor=ACCENT,
-            highlightbackground="#1e293b",
-        )
-        self.entry.pack(side="left", fill="x", expand=True, ipady=7)
+        row.pack(fill="x", padx=14, pady=(0, 8))
+        field = RoundedEntry(row, "Type a message, or hold Space to talk")
+        field.pack(side="left", fill="x", expand=True)
+        self.entry = field.entry
         self.entry.bind("<Return>", self._send)
         # Widget bindings run before the Entry inserts the space, so an empty
         # chat box can still be push-to-talk.
         self.entry.bind("<KeyPress-space>", self._space_down)
         self.entry.bind("<KeyRelease-space>", self._space_up)
-        self._button(row, "Send", self._send).pack(side="left", padx=(8, 0))
-        self.mic_button = self._button(row, "🎤 Hold to talk", None)
+        Pill(row, "Send", self._send, fill=ACCENT_FILL, hover=ACCENT_HOVER).pack(side="left", padx=(10, 0))
+        self.mic_button = Pill(row, "🎤 Hold to talk")
         self.mic_button.pack(side="left", padx=(8, 0))
         # Tk sends the release to the button even if the mouse left it.
-        self.mic_button.bind("<ButtonPress-1>", lambda e: self._talk_down("button"))
-        self.mic_button.bind("<ButtonRelease-1>", lambda e: self._talk_up("button"))
-        self._button(row, "■ Stop", self._stop_speaking, fg=DANGER).pack(side="left", padx=(8, 0))
+        self.mic_button.bind("<ButtonPress-1>", lambda e: self._talk_down("button"), add="+")
+        self.mic_button.bind("<ButtonRelease-1>", lambda e: self._talk_up("button"), add="+")
+
+        controls = tk.Frame(panel, bg=PANEL)
+        controls.pack(fill="x", padx=16, pady=(0, 4))
         self.hands_free = tk.BooleanVar(value=False)
-        tk.Checkbutton(
-            row, text="Hands-free", variable=self.hands_free, command=self._toggle_hands_free,
-            bg=PANEL, fg=TEXT, selectcolor=FIELD, activebackground=PANEL, activeforeground=TEXT,
-            font=("Segoe UI", 10), takefocus=0,
-        ).pack(side="left", padx=(10, 0))
+        Toggle(controls, "Hands-free", self.hands_free, self._toggle_hands_free).pack(side="left")
         self.hands_on = tk.BooleanVar(value=False)
-        tk.Checkbutton(
-            row, text="✋ Hands", variable=self.hands_on, command=self._toggle_camera,
-            bg=PANEL, fg=TEXT, selectcolor=FIELD, activebackground=PANEL, activeforeground=TEXT,
-            font=("Segoe UI", 10), takefocus=0,
-        ).pack(side="left", padx=(6, 0))
+        Toggle(controls, "✋ Hands", self.hands_on, self._toggle_camera).pack(side="left", padx=(18, 0))
+        Pill(controls, "■ Stop", self._stop_speaking, fg=DANGER).pack(side="right")
 
         self.status = tk.Label(
-            panel, bg=PANEL, fg=MUTED, font=("Segoe UI", 9), anchor="w",
+            panel, bg=PANEL, fg=MUTED, font=("Segoe UI", 9), anchor="w", justify="left",
             text="Loading models…",
         )
-        self.status.pack(fill="x", padx=16, pady=(0, 10), side="bottom", before=row)
+        self.status.pack(fill="x", padx=18, pady=(0, 10))
+        self.status.bind("<Configure>", lambda e: self.status.configure(wraplength=max(100, e.width)))
 
         root.bind("<KeyPress-space>", self._space_down)
         root.bind("<KeyRelease-space>", self._space_up)
@@ -365,17 +405,22 @@ class Window:
         # must not leave the mic recording.
         root.bind("<FocusOut>", lambda e: root.after(50, self._release_if_unfocused))
 
+    def _bubble_width(self) -> int:
+        return int(max(200, self.log.winfo_width()) * BUBBLE_SHARE)
+
+    def _fit_bubbles(self) -> None:
+        width = self._bubble_width()
+        for bubble in self._bubbles:
+            bubble.set_max_width(width)
+
+    def _wheel(self, event) -> str:
+        """Scroll by pixels: a bubble is one tall line, so line steps jump."""
+        self.log.yview_scroll(int(-event.delta / 120 * 48), "pixels")
+        return "break"
+
     def _release_if_unfocused(self) -> None:
         if self.root.focus_get() is None:
             self._talk_up("space")
-
-    def _button(self, parent, text, command, fg=TEXT) -> tk.Button:
-        # takefocus=0: Space must never "click" a focused button.
-        return tk.Button(
-            parent, text=text, command=command, bg=FIELD, fg=fg, activebackground="#1e293b",
-            activeforeground=fg, relief="flat", font=("Segoe UI", 10), padx=12, pady=6, cursor="hand2",
-            takefocus=0,
-        )
 
     # ----- startup ---------------------------------------------------------
 
@@ -459,6 +504,7 @@ class Window:
     def _camera_state(self, on: bool) -> None:
         self.hands_on.set(on)
         self.orb.set_camera(on)
+        self.camera_chip.set(*(("Camera on", GO) if on else ("Camera off", MUTED)))
 
     def _show_window(self) -> None:
         self.root.deiconify()
@@ -553,7 +599,7 @@ class Window:
                 overlay=lambda: Overlay(self.root),
             )
             if stt is None:
-                self.mic_button.configure(state="disabled", text="🎤 (no mic)")
+                self._no_mic()
             else:
                 session = self.session
                 self.talk_key = TalkKey(
@@ -570,7 +616,7 @@ class Window:
             self._append("note", self._help_text)
             self.status.configure(text="Not running.")
         elif kind == "mic_gone":
-            self.mic_button.configure(state="disabled", text="🎤 (no mic)")
+            self._no_mic()
         elif kind == "quit":
             self.entry.configure(state="disabled")
             self.root.after(200, self.root.destroy)
@@ -591,10 +637,18 @@ class Window:
         self.face.set_state(state)
         self.face.set_level(level)
         self.orb.set_state(state, level)
+        self.state_chip.set(*STATES[state])
         recording = bool(s and s.recording)
+        if self._mic_ok:
+            self.mic_chip.set(*(("Recording", DANGER) if recording else ("Mic ready", GO if s else MUTED)))
         if recording != self._button_lit:  # reconfigure only on change
             self._button_lit = recording
-            self.mic_button.configure(bg="#14532d" if recording else FIELD)
+            self.mic_button.set_lit(RECORDING if recording else None)
+
+    def _no_mic(self) -> None:
+        self._mic_ok = False
+        self.mic_button.configure(state="disabled", text="🎤 No mic")
+        self.mic_chip.set("No mic", DANGER)
 
     def _show_hint(self) -> None:
         if self.hands_free.get():
@@ -605,22 +659,24 @@ class Window:
         self.status.configure(text=hint)
 
     def _append(self, kind: str, text: str) -> None:
-        self.log.configure(state="normal")
-        if kind == "you":
-            self.log.insert("end", "You  ", "you")
-            self.log.insert("end", text + "\n", "you")
-        elif kind == "bot" and self._last_kind == "bot":
-            # The next sentence of the same reply: continue the paragraph.
-            self.log.delete("end-2c")  # the paragraph's newline
-            self.log.insert("end", " " + text + "\n", "bot")
-        elif kind == "bot":
-            self.log.insert("end", f"{NAME.title()}  ", "who_bot")
-            self.log.insert("end", text + "\n", "bot")
+        log = self.log
+        log.configure(state="normal")
+        if kind == "bot" and self._last_kind == "bot" and self._bubbles:
+            # The next sentence of the same reply: continue the bubble.
+            self._bubbles[-1].set_text(self._bubbles[-1].text + " " + text)
+        elif kind in ("bot", "you"):
+            bubble = Bubble(log, text, YOU_BUBBLE if kind == "you" else BOT_BUBBLE, TEXT, self._bubble_width())
+            bubble.bind("<MouseWheel>", self._wheel)
+            self._bubbles.append(bubble)
+            start = log.index("end-1c")
+            log.window_create("end", window=bubble)
+            log.insert("end", "\n")
+            log.tag_add(kind, start, "end-1c")
         else:
-            self.log.insert("end", text + "\n", "note")
+            log.insert("end", text + "\n", "note")
         self._last_kind = kind
-        self.log.configure(state="disabled")
-        self.log.see("end")
+        log.configure(state="disabled")
+        log.see("end")
 
     def _quit(self) -> None:
         if self.hand_control is not None:

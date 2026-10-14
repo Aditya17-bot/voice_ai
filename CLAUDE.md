@@ -34,7 +34,7 @@ Target: end-to-end response under 2 seconds, with a filler/fallback flow when th
 - `assistant/tools.py` — read-only sandbox: folders, files, app/site launching
 - `assistant/router.py` — regex fast path for spoken commands, follow-up helpers
 - `assistant/classifier.py` — constrained-JSON LLM fallback for commands the router misses
-- `assistant/ui.py` — the window: chat, push-to-talk, worker and mic threads; `assistant/face.py` — animated faces; `assistant/orb.py` — corner orb; `assistant/hotkey.py` — Right Ctrl talk key
+- `assistant/ui.py` — the window: chat, push-to-talk, worker and mic threads; `assistant/face.py` — animated faces; `assistant/widgets.py` — canvas-drawn buttons, toggles, chips, chat bubbles; `assistant/orb.py` — corner orb; `assistant/hotkey.py` — Right Ctrl talk key
 - `assistant/hands.py` — webcam + MediaPipe thread; `gestures.py` — pure gesture rules; `handmenu.py` — hand menu tiles, overlay, glue; `windows.py` — close/switch windows and desktops (ctypes)
 - `assistant/youtube.py`, `gmail.py`, `github.py` — read-only web reads; `memory.py`; `credentials.py`; `setup.py` — account setup CLI
 - `tests/` — stdlib `unittest` suites; `eval_classifier.py` is a live eval needing Ollama
